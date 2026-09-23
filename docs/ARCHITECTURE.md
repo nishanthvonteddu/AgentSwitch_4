@@ -17,8 +17,8 @@ database rather than the agent's prose.
   your question
        │
   ┌────▼─────────────────────────────────────────┐
-  │  the loop            prod_agent/agent.py     │   talk to the model, run a tool, repeat
-  │  ~20 steps max                               │
+  │  the loop            prod_agent/agent.py     │   talk to the model, run its tool calls, repeat
+  │  ~20 steps max                               │   independent reads in one batch run together
   ├──────────────────────────────────────────────┤
   │  9 tools             prod_agent/agent.py     │   the ONLY things the model may ask for
   ├──────────────────────────────────────────────┤
@@ -117,10 +117,26 @@ something went wrong live.
 | re-read before write | `apply_proposal` → `changed_underneath` | overwriting somebody's edit |
 | conflict stops everything | `self.conflicts` | retrying into a race |
 | escalation before filing | `_dispatch("record_finding")` | quietly dropping work a person must pick up |
+| a failed escalation is still an escalation | `except` in `_dispatch("escalate")` | the rule below refusing every later call, so the run ends with nothing filed |
 | costs must be real | cost check in `record_finding` | computing a variance when no cost was recorded |
+| no null where the schema forbids null | `_nulled_required()` in `record_finding` | filing a finding the model left half-built, and calling the run a success |
 
 The escalation rule is worth reading twice: if `needs_person` is non-empty and nothing was escalated,
 `record_finding` is **refused** and the model is told to escalate first. A handover is not optional.
+
+That rule is also why a throwing `escalate` has to leave a record behind. If `open_agent_session` or
+`raise_escalation` raises, the failure is appended to `self.escalations` as `reason_code:
+escalation_failed`, exactly as a platform refusal would be. Without it the guard above refuses every
+remaining `record_finding`, the forced wrap-up has nothing left to force, and the run ends with no
+finding in the database — breaking the first guarantee in this table.
+
+The last row is the newest, and the cheapest to get wrong. `RECORD_FINDING_SCHEMA` is handed to the model
+as the tool definition, but nothing used to check the answer against it on the way back. On 2026-09-22 a
+model returned `outcome: null` on a refusal that was otherwise correct; it was persisted, the run reported
+`final_answer`, and the verifier scored it `revise`. `_nulled_required()` now rejects any *required* field
+sent as `null` that the schema does not declare nullable, and names them so the model can retry — there is
+almost always budget left. An **absent** field is not an error: a caller may record a partial finding
+(`tests/test_production.py` files `{"outcome": "refused"}` alone), so only a sent-but-null value counts.
 
 ---
 
@@ -220,6 +236,40 @@ It hangs off `approve()` in `runner.py`, which is the last moment before a write
 
 ---
 
+## 8a. What makes a step slow, and what was done about it
+
+Measured on Suryodaya, 2026-09-22: a `.list` call returning 200 rows takes ~2.3s; the same call returning
+**one** row takes ~2-3.5s. Latency is per round-trip and barely moves with payload size. So the thing to
+cut is the number of calls, not the number of rows — narrowing a read into several targeted queries makes
+a step *slower*, which is why `diagnose` still fetches broadly and filters in Python.
+
+Three changes follow from that, and together they took one real step from 112s to 36s with byte-identical
+output (`WO-2026-00047`, compared against the previous implementation on live data):
+
+| change | where | effect |
+|---|---|---|
+| independent reads in one batch overlap | `_invoke_batch()` | the model usually asks for several reads at once; they now run together |
+| reads are reused within a run | `self._reads` → `propose_reschedule(diag=, down=)` | `propose_reschedule` re-ran a whole diagnosis and BOM walk the model had already paid for |
+| windowed reads stop at the window edge | `McpClient.list_window()` | a 30-day downtime question no longer pages the whole table |
+
+`_invoke_batch` splits a batch into **contiguous runs** of parallel-safe calls, so the model's ordering is
+preserved and a write never jumps ahead of a read. `PARALLEL_SAFE` is the reads only; `apply_reschedule`,
+`escalate` and `record_finding` stay serial because each gates on state the others must not race.
+`propose_reschedule` is in the set: it only ever *appends* to `_proposals` and `needs_person`. The repeat
+guard runs serially before dispatch, because "already called at step N" depends on batch order. One
+`McpClient` is shared by the batch, so its request counter and re-login are locked.
+
+Reusing a read is safe for exactly the reason `REPEAT_GUARDED` already tells the model a repeated read is
+"still current": within one run these answers are not expected to change. The cache is keyed on the work
+order reference, so a different order re-reads.
+
+`list_window` exists because `.list` filters are **equality-only** — no date ranges — but `sort_by` /
+`sort_order` work. It pages newest-first and stops at the first row older than the window, then returns
+oldest-first so callers aggregate in a stable order. At today's table sizes (~100 downtime rows) this is
+one call either way; it is what stops a 30-day question reading three years of history later.
+
+---
+
 ## 9. Where to change things
 
 | you want to | do this |
@@ -227,7 +277,7 @@ It hangs off `approve()` in `runner.py`, which is the last moment before a write
 | add a delay cause | emit a new signal in `domain.diagnose`, then decide if it belongs in `UNDATED_BLOCKERS` |
 | add a harness task | drop a JSON in `harness/tasks/team04/` + a verifier function; no registration needed |
 | add a fixture | add to `FIXTURES` in `harness/fixtures.py` (only `late_draft_chain` today) |
-| add a tool | `_fn(...)` spec **and** a `_dispatch()` branch |
+| add a tool | `_fn(...)` spec **and** a `_dispatch()` branch — plus `PARALLEL_SAFE` if it is a read that touches no run state |
 | write a graded test | `tests/` only, by hand — AI-written tests score zero. AI-assisted work goes in `tests_ai/`, labelled |
 
 `tests/` (40 tests) is hand-written and graded. `harness/` tasks and verifiers are AI-assisted and labelled
@@ -235,17 +285,20 @@ as such in every file header. Keep that line clean.
 
 ---
 
-## 10. Constraints as of 2026-09-20
+## 10. Constraints as of 2026-09-22
 
-- **SalesOrder read was revoked from this seat** by the 2026-09-20 release. REST returns 403 and no
-  `SalesOrder.*` tools are listed, although `/api/auth/me` still advertises the now-empty `sales_viewer`
-  role and `/api/schemas` still lists the entity. Customer-impact answers are therefore unreachable; the
-  agent reports it under "Not visible to me" rather than guessing, and
-  `refuse_sales_order_date_change` cannot be scored.
+- **SalesOrder read is available again.** The 2026-09-20 release revoked it (bug N140); the fix is live
+  and re-verified on both instances on 2026-09-22 — `SalesOrder.list`, `SalesOrder.get` and
+  `SalesOrder.make.WorkOrder` are back in the catalogue and readable. Customer-impact answers are
+  reachable again. `SalesOrder.update` remains absent, which is what makes
+  `refuse_sales_order_date_change` a refusal case rather than an unreachable one.
 - **Submitted work orders are date-locked** for `manufacturing_user`, so the agent writes dates on drafts
   only and proposes the rest. Cancel is admin-only.
-- **Work orders have no parent/child link**, which is why downstream impact is a reverse BOM walk and its
-  results are "potential", not confirmed.
+- **Work orders carry no parent/child link *in this data***, which is why downstream impact is a reverse BOM
+  walk and its results are "potential", not confirmed. `WorkOrder.supplies_work_order_id` exists and is
+  writable on create/update, but is empty on all 133 orders (Suryodaya) and all 77 (Keystone), as of
+  2026-09-22 — so there is nothing to walk. If it is ever populated, downstream impact could report
+  confirmed links instead of inferring potential ones, and this tool should be revisited.
 - **Outside the seat:** PurchaseOrder, StockEntry, Employee, SalarySlip (REST 403, absent from the
   catalogue).
 - Seat limits have already moved twice (17 and 20 September). Re-probe rather than trusting this list;

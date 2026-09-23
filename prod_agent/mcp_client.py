@@ -3,6 +3,7 @@
 A JSON-RPC error still arrives as HTTP 200, so every call inspects the envelope.
 """
 import json
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -85,6 +86,7 @@ class Session:
             raise ValueError(f"unknown instance {instance!r}")
         self.instance = instance
         self.base = config.INSTANCES[instance]
+        self._lock = threading.Lock()
         self._token_file = TOKEN_DIR / f"team04-{instance}.token"
         self.token = self._token_file.read_text().strip() if self._token_file.exists() else None
         if not self.token:
@@ -104,14 +106,28 @@ class Session:
         try:
             return fn()
         except AuthExpired:
-            self.login()
+            stale = self.token
+            with self._lock:
+                # Concurrent tool calls share one session: whoever gets here first re-logs in, the rest reuse it.
+                if self.token == stale:
+                    self.login()
             return fn()
+
+
+def _is_descending(batch: list[dict], field: str) -> bool | None:
+    """True/False if `batch` proves the sort direction, None if it is too short or too uniform to tell."""
+    values = [(r.get(field) or "")[:10] for r in batch]
+    values = [v for v in values if v]
+    if len(values) < 2 or values[0] == values[-1]:
+        return None
+    return values[0] > values[-1]
 
 
 class McpClient:
     def __init__(self, session: Session):
         self.session = session
         self._id = 0
+        self._lock = threading.Lock()
         self._tools = None
         self.session.with_reauth(self._initialize)
 
@@ -129,8 +145,10 @@ class McpClient:
         return name.endswith((".list", ".get")) or name in cls.READ_ONLY_ENDPOINTS
 
     def _rpc(self, method, params=None):
-        self._id += 1
-        body = {"jsonrpc": "2.0", "id": self._id, "method": method, "params": params or {}}
+        with self._lock:
+            self._id += 1
+            request_id = self._id
+        body = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}}
         status, payload = _http(f"{self.session.base}/api/mcp", body, self.session.token,
                                 read_only=self._is_read_only(method, params))
         if status != 200 or payload is None:
@@ -173,6 +191,36 @@ class McpClient:
         if result.get("isError"):
             raise McpError("tool_error", json.dumps(content)[:500], content)
         return content
+
+    def list_window(self, entity: str, field: str, since: str, page: int = 200, **filters) -> list[dict]:
+        """Rows of `entity` from `since` onwards, oldest first.
+
+        `.list` filters are equality-only, so a date range cannot be pushed to the server, but the sort can:
+        paging newest-first and stopping at the window edge bounds the read by the window rather than by the
+        size of the table. Returned oldest first so callers aggregate in a stable order — the unsorted scan
+        this replaces was in whatever order the server happened to return.
+        """
+        rows, offset, descending = [], 0, None
+        while True:
+            res = self.call(f"{entity}.list", {"limit": page, "offset": offset,
+                                               "sort_by": field, "sort_order": "desc", **filters})
+            batch = res.get("data", []) if isinstance(res, dict) else res
+            if descending is None:
+                descending = _is_descending(batch, field)
+                if descending is False:
+                    # B14: this platform accepts an invalid sort_order silently and serves ascending. Stopping
+                    # early on ascending rows would return nothing at all, so fall back to reading the table.
+                    return [r for r in self.list_all(entity, page=page, **filters)
+                            if ((r.get(field) or "")[:10] or since) >= since]
+            for row in batch:
+                value = (row.get(field) or "")[:10]
+                if value and value < since:
+                    return rows[::-1]
+                rows.append(row)
+            total = res.get("total") if isinstance(res, dict) else None
+            offset += len(batch)
+            if not batch or len(batch) < page or (total is not None and offset >= total):
+                return rows[::-1]
 
     def list_all(self, entity: str, page: int = 200, **filters) -> list[dict]:
         rows, offset = [], 0

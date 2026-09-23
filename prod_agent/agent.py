@@ -4,6 +4,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Callable
+from concurrent import futures
 
 from . import config, domain
 from .mcp_client import McpClient, McpError
@@ -62,6 +63,25 @@ RECORD_FINDING_SCHEMA = {
 }
 
 
+def _nulled_required(args: dict) -> list[str]:
+    """Required fields the model sent as null where its own schema does not allow null.
+
+    Only fields it actually sent: a caller may record a partial finding (tests/test_production.py:757), so an
+    absent field is the caller's choice. A field sent as null contradicts the type the model was handed, which
+    is the failure this catches. Driven by RECORD_FINDING_SCHEMA rather than a second list, so a field added
+    there is covered here.
+    """
+    properties = RECORD_FINDING_SCHEMA["properties"]
+    nulled = []
+    for field in RECORD_FINDING_SCHEMA["required"]:
+        if args.get(field, "") is not None:
+            continue
+        declared = properties.get(field, {}).get("type")
+        if not ("null" in declared if isinstance(declared, list) else declared == "null"):
+            nulled.append(field)
+    return nulled
+
+
 def _fn(name, description, properties=None, required=None):
     return {"type": "function", "function": {"name": name, "description": description, "parameters": {
         "type": "object", "properties": properties or {}, "required": required or []}}}
@@ -103,6 +123,9 @@ class ProductionAgent:
         self.finding: dict | None = None
         self.finding_record: dict | None = None
         self._seen_calls: dict[tuple[str, str], int] = {}
+        # Reads REPEAT_GUARDED already promises are "still current" for the rest of the run, kept so
+        # propose_reschedule does not re-run a diagnosis and a BOM walk the model has already paid for.
+        self._reads: dict[tuple[str, str], dict] = {}
         if llm is None:
             from openai import OpenAI
             # The SDK backs off on 429/5xx; the default 2 retries is too few for a 30k tokens-per-minute key.
@@ -184,11 +207,14 @@ class ProductionAgent:
             rows = domain.list_late_work_orders(self.mcp)
             return {"count": len(rows), "work_orders": rows[:40], "truncated": len(rows) > 40}
         if name == "diagnose_work_order":
-            return domain.diagnose(self.mcp, ref)
+            self._reads["diagnose", ref] = result = domain.diagnose(self.mcp, ref)
+            return result
         if name == "downstream_impact":
-            return domain.downstream_impact(self.mcp, ref)
+            self._reads["downstream", ref] = result = domain.downstream_impact(self.mcp, ref)
+            return result
         if name == "propose_reschedule":
-            result = domain.propose_reschedule(self.mcp, ref)
+            result = domain.propose_reschedule(self.mcp, ref, diag=self._reads.get(("diagnose", ref)),
+                                               down=self._reads.get(("downstream", ref)))
             for p in result.get("proposals", []):
                 self._proposals[p["work_order_id"]] = p
                 if not p.get("writable_by_seat") and p["number"] == (result.get("work_order") or {}).get("number"):
@@ -219,16 +245,30 @@ class ProductionAgent:
         if name == "escalate" and self.escalate_mode:
             if len(self.escalations) >= self.max_escalations:
                 return {"raised": False, "reason_code": "limit", "detail": "already escalated in this run"}
-            if self.session_id is None:
-                self.session_id = domain.open_agent_session(self.mcp, self.session_title)
             ref_text = f"[{args['work_order']}] " if args.get("work_order") else ""
-            result = domain.raise_escalation(self.mcp, self.session_id, ref_text + args["reason"],
-                                             args.get("reason_code", "policy_refusal"))
+            try:
+                if self.session_id is None:
+                    self.session_id = domain.open_agent_session(self.mcp, self.session_title)
+                result = domain.raise_escalation(self.mcp, self.session_id, ref_text + args["reason"],
+                                                 args.get("reason_code", "policy_refusal"))
+            except Exception as e:
+                # A throwing escalation still has to land in self.escalations. Without this the loop's own
+                # handler returns the error without appending, record_finding's guard below then refuses every
+                # remaining call, and the run ends with no finding in the database at all.
+                self.trace({"type": "exception", "tool": "escalate", "traceback": traceback.format_exc()})
+                result = {"raised": False, "reason_code": "escalation_failed", "detail": str(e)}
             self.escalations.append(result)
             return result
         if name == "record_finding":
             if self.finding is not None:
                 return {"error": "finding already recorded for this run"}
+            nulled = _nulled_required(args)
+            if nulled:
+                # The schema is sent to the model but was never checked on the way back, so a model that
+                # sent null for a non-nullable field (seen live 2026-09-22: outcome=null on a refusal, which
+                # the verifier scored revise) had that gap persisted and the run reported success.
+                return {"error": "these fields cannot be null", "fields": nulled,
+                        "instruction": "call record_finding again with a real value for each listed field"}
             cost = args.get("cost") or {}
             if cost and not (cost.get("expected") or cost.get("actual")):
                 return {"error": "cost must be null when no cost is recorded (expected and actual are 0 or missing)",
@@ -243,6 +283,46 @@ class ProductionAgent:
             self.finding_record = domain.record_finding(self.mcp, self.run_id, args)
             return self.finding_record
         return {"error": f"unknown tool {name}"}
+
+    # Reads that touch no run-critical state, so several of them can be in flight at once. propose_reschedule
+    # qualifies: it only ever appends to _proposals and needs_person. The writes (apply_reschedule, escalate,
+    # record_finding) stay serial — each gates on state the others must not race.
+    PARALLEL_SAFE = {"company_context", "list_late_work_orders", "diagnose_work_order", "downstream_impact",
+                     "propose_reschedule", "downtime_summary", "seat_entities", "seat_capability"}
+    MAX_PARALLEL = 8
+
+    def _invoke(self, call, note: dict | None) -> tuple[dict, str | None, float, str | None]:
+        """Run one tool call. Traces and messages are left to the caller so a batch of these can run in threads."""
+        t0, tb = time.time(), None
+        try:
+            args = json.loads(call.function.arguments or "{}")
+            result, error = note or self._dispatch(call.function.name, args), None
+        except McpError as e:
+            result, error = {"error": e.message, "kind": e.kind}, e.kind
+        except Exception as e:  # tool bugs must not kill the run; the caller traces tb
+            result, error, tb = {"error": str(e)}, "exception", traceback.format_exc()
+        return result, error, round(time.time() - t0, 2), tb
+
+    def _invoke_batch(self, calls, notes) -> list[tuple]:
+        """Run one batch of tool calls, overlapping adjacent independent reads. Order of results is the order asked."""
+        groups: list[tuple[bool, list[int]]] = []
+        for i, call in enumerate(calls):
+            parallel = call.function.name in self.PARALLEL_SAFE
+            if parallel and groups and groups[-1][0]:
+                groups[-1][1].append(i)
+            else:
+                groups.append((parallel, [i]))
+        results: list[tuple | None] = [None] * len(calls)
+        for parallel, idxs in groups:
+            if parallel and len(idxs) > 1:
+                self.mcp.tool_names()  # warm the catalogue once here, not once per worker
+                with futures.ThreadPoolExecutor(max_workers=min(len(idxs), self.MAX_PARALLEL)) as pool:
+                    for i, out in zip(idxs, pool.map(lambda j: self._invoke(calls[j], notes[j]), idxs)):
+                        results[i] = out
+            else:
+                for i in idxs:
+                    results[i] = self._invoke(calls[i], notes[i])
+        return results
 
     # ------------------------------------------------------------------ loop
     def run(self, request: str) -> dict:
@@ -282,21 +362,22 @@ class ProductionAgent:
             if not msg.tool_calls:
                 final, stop_reason = msg.content, "final_answer"
                 break
+            # The repeat guard stays serial and in order: its "already called at step N" answer depends on what
+            # came earlier in this same batch. Bad JSON is left for _invoke, where the existing handler traces it.
+            notes = []
             for call in msg.tool_calls:
-                t0 = time.time()
                 try:
-                    args = json.loads(call.function.arguments or "{}")
-                    result = (self._repeat_note(call.function.name, args, step)
-                              or self._dispatch(call.function.name, args))
-                    error = None
-                except McpError as e:
-                    result, error = {"error": e.message, "kind": e.kind}, e.kind
-                except Exception as e:  # tool bugs must not kill the run; they are traced
-                    result, error = {"error": str(e)}, "exception"
-                    self.trace({"type": "exception", "tool": call.function.name, "traceback": traceback.format_exc()})
+                    notes.append(self._repeat_note(call.function.name,
+                                                   json.loads(call.function.arguments or "{}"), step))
+                except ValueError:
+                    notes.append(None)
+            results = self._invoke_batch(msg.tool_calls, notes)
+            for call, (result, error, seconds, tb) in zip(msg.tool_calls, results):
+                if tb is not None:
+                    self.trace({"type": "exception", "tool": call.function.name, "traceback": tb})
                 self.trace({"type": "tool", "step": step, "name": call.function.name,
                             "arguments": call.function.arguments, "error": error,
-                            "seconds": round(time.time() - t0, 2), "result": result})
+                            "seconds": seconds, "result": result})
                 messages.append({"role": "tool", "tool_call_id": call.id,
                                  "content": json.dumps(result, default=str)[:60000]})
         outcome = {"run_id": self.run_id, "stop_reason": stop_reason, "final_answer": final,

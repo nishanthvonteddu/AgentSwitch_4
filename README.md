@@ -70,14 +70,14 @@ Output goes to `runs/<timestamp>/<instance>/<task>/`: `task.json`, `fixture.json
 - **Writes only what the seat can write.** Submitted work orders are date-locked for `manufacturing_user` (verified live), so the agent writes dates on drafts only and proposes the rest.
 - **Two gates on writes.** Every write needs approval (a human prompt in the CLI; in the harness, only the team's own fixture rows) and must be in the allowed-id set.
 - **The finding goes into the database.** `record_finding` stores the structured conclusion in AgentMemory (private to our team), so verifiers read state, not prose.
-- **Cannot loop past its budget.** A repeated read with identical arguments returns a note instead of running again, and in the last steps the loop forces `record_finding` (after a required escalation), so a run always leaves its finding in the database.
+- **Cannot loop past its budget.** A repeated read with identical arguments returns a note instead of running again, and in the last steps the loop forces `record_finding` (after a required escalation), so a run always leaves its finding in the database — an escalation that *fails* is recorded as one too, or that required-escalation rule would refuse every remaining call and leave nothing filed.
 - **Tells a real access limit from a guessed name.** `seat_capability` asks REST: 403 means the entity exists but is outside the seat (reported in `not_visible`), 404 means the name was invented, and a wrong operation name on a visible entity (e.g. `JobCard.read`) returns the real operations.
 - **Nothing is hardcoded to one country.** Country and currency come from `Company`, and missing tools (e.g. SalesOrder on Keystone) are detected, not assumed.
 
 ## Seat limits the agent reports rather than works around (2026-09-17)
 
 - **Readable since 17 Sep (after our bug reports):** JobCard, DowntimeEntry and EngineeringChangeOrder on both instances. The agent probes access on every run instead of assuming it.
-- **SalesOrder:** read-only on both instances (Keystone gained `sales_viewer` on 17 Sep).
+- **SalesOrder:** read-only on both instances (Keystone gained `sales_viewer` on 17 Sep). Read was revoked by the 20 Sep release and restored on 22 Sep — `.list`/`.get` verified on both, `.update` still absent.
 - **Outside the seat:** PurchaseOrder, StockEntry, Employee and payroll (REST 403, not in the catalogue).
 - **Links and locks:** WorkOrder has no parent/child link, so downstream impact comes from a reverse walk of BOM materials. Submitted work orders are date-locked, and cancel is admin-only (no longer listed for this seat).
 

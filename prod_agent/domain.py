@@ -155,7 +155,9 @@ def downtime_summary(mcp: McpClient, days: int = 30, reason: str | None = None) 
     stations = {w["id"]: w for w in mcp.list_all("Workstation")}
     per_ws: dict[str, dict] = {}
     counted = 0
-    for d in mcp.list_all("DowntimeEntry"):
+    # Round-trips dominate here, not rows: read newest-first and stop at the window edge rather than
+    # paging the whole table. The reason filter is an equality match the server can do.
+    for d in mcp.list_window("DowntimeEntry", "from_time", _iso(since), **({"reason": reason} if reason else {})):
         began = _date(d.get("from_time"))
         if not began or began < since or (reason and d.get("reason") != reason):
             continue
@@ -319,7 +321,11 @@ def diagnose(mcp: McpClient, ref: str) -> dict:
     if downtime_readable:
         since = today - dt.timedelta(days=DOWNTIME_LOOKBACK_DAYS)
         route_totals: dict[str, dict] = {}
-        for d in mcp.list_all("DowntimeEntry"):
+        # Entries on this order at any age, plus everything inside the lookback window for the route check.
+        # Every job-card entry carries work_order_id too, so the first read covers both links.
+        merged = {d["id"]: d for d in mcp.list_all("DowntimeEntry", work_order_id=wid)}
+        merged.update({d["id"]: d for d in mcp.list_window("DowntimeEntry", "from_time", _iso(since))})
+        for d in sorted(merged.values(), key=lambda r: ((r.get("from_time") or ""), r["id"])):
             on_order = d.get("work_order_id") == wid or d.get("job_card_id") in card_ids
             began, ended = _date(d.get("from_time")), _date(d.get("to_time"))
             recent_on_route = d.get("workstation_id") in route_ws and began and began >= since
@@ -371,13 +377,20 @@ def downstream_impact(mcp: McpClient, ref: str, max_depth: int = 3) -> dict:
     open_wos = [w for w in mcp.list_all("WorkOrder") if w.get("status") in OPEN_WO]
     bom_inputs = {b["id"]: {m.get("item_id") for m in (b.get("materials") or [])} for b in mcp.list_all("BOM")}
 
+    # item consumed -> the open orders whose BOM consumes it, so the walk below is a lookup per node
+    # rather than a scan of every open order per node. Built from open_wos, so the order of hits is unchanged.
+    consumers: dict[str, list[dict]] = {}
+    for w in open_wos:
+        for item_id in bom_inputs.get(w.get("bom_id"), ()):
+            consumers.setdefault(item_id, []).append(w)
+
     blocked, visited, frontier = [], {wo["id"]}, [(wo, 0)]
     while frontier:
         parent, depth = frontier.pop(0)
         if depth >= max_depth:
             continue
-        for w in open_wos:
-            if w["id"] in visited or parent.get("item_id") not in bom_inputs.get(w.get("bom_id"), set()):
+        for w in consumers.get(parent.get("item_id"), ()):
+            if w["id"] in visited:
                 continue
             visited.add(w["id"])
             # A BOM match shows possible demand, not a confirmed supply link: stock or another order may cover it.
@@ -437,11 +450,12 @@ def downstream_impact(mcp: McpClient, ref: str, max_depth: int = 3) -> dict:
 
 # --------------------------------------------------------------------------- reschedule
 
-def propose_reschedule(mcp: McpClient, ref: str) -> dict:
-    diag = diagnose(mcp, ref)
+def propose_reschedule(mcp: McpClient, ref: str, diag: dict | None = None, down: dict | None = None) -> dict:
+    """diag/down let a caller hand in results it already fetched this run; both are re-read when absent."""
+    diag = diag or diagnose(mcp, ref)
     if not diag["found"]:
         return diag
-    down = downstream_impact(mcp, ref)
+    down = down or downstream_impact(mcp, ref)
     today = config.today()
     target = diag["work_order"]
 
