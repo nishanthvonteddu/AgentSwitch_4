@@ -93,6 +93,24 @@ def _nulled_required(args: dict) -> list[str]:
     return nulled
 
 
+TOOL_CONTENT_LIMIT = 60000
+
+
+def _tool_content(result) -> str:
+    """Serialise a tool result for the model, saying so when it did not fit.
+
+    Cutting mid-JSON leaves a fragment that reads as a whole answer, which is how a model comes to
+    report a page as the entire table. The note costs a line and makes the loss visible.
+    """
+    text = json.dumps(result, default=str)
+    if len(text) <= TOOL_CONTENT_LIMIT:
+        return text
+    return (text[:TOOL_CONTENT_LIMIT] +
+            f'\n\n[TRUNCATED: {len(text)} characters of tool output cut to {TOOL_CONTENT_LIMIT}. '
+            'You are seeing part of this result, and the JSON above is incomplete. Do not count, total or '
+            'average over it; narrow the query with filters and call again, or say what you could not read.]')
+
+
 def _fn(name, description, properties=None, required=None):
     return {"type": "function", "function": {"name": name, "description": description, "parameters": {
         "type": "object", "properties": properties or {}, "required": required or []}}}
@@ -423,7 +441,7 @@ class ProductionAgent:
                             "arguments": call.function.arguments, "error": error,
                             "seconds": seconds, "result": result})
                 messages.append({"role": "tool", "tool_call_id": call.id,
-                                 "content": json.dumps(result, default=str)[:60000]})
+                                 "content": _tool_content(result)})
         outcome = {"run_id": self.run_id, "stop_reason": stop_reason, "final_answer": final,
                    "finding": self.finding, "finding_record": self.finding_record,
                    "escalations": self.escalations, "agent_session_id": self.session_id, "conflicts": self.conflicts,

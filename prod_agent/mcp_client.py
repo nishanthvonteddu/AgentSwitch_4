@@ -43,6 +43,16 @@ CONNECT_BACKOFF_SECONDS = 2.0
 
 GATEWAY_ERRORS = {502, 503, 504}
 
+# A table read with no filter still has to end. High enough that no current book reaches it, low enough
+# that hitting it is a bug in the caller's filters rather than an afternoon of sequential requests.
+LIST_ALL_MAX_ROWS = 5000
+
+
+class RowPage(list):
+    """Rows, plus whether they are all of them. A plain list to every existing caller."""
+    total: int | None = None
+    truncated: bool = False
+
 
 def _http(url, body=None, token=None, method=None, timeout=120, retries=CONNECT_RETRIES, read_only=None):
     """read_only: retry gateway errors too. Defaults to True for bodiless requests (GET). A gateway error on a
@@ -222,15 +232,30 @@ class McpClient:
             if not batch or len(batch) < page or (total is not None and offset >= total):
                 return rows[::-1]
 
-    def list_all(self, entity: str, page: int = 200, **filters) -> list[dict]:
-        rows, offset = [], 0
+    def list_all(self, entity: str, page: int = 200, max_rows: int = LIST_ALL_MAX_ROWS, **filters) -> "RowPage":
+        """Every matching row, up to a ceiling that is never crossed silently.
+
+        Filter at the server wherever the caller can: `.list` takes equality and CSV-means-OR, so
+        `status="draft,not_started"` is one narrowed read instead of the whole table narrowed in Python.
+        Where no filter exists the ceiling is what stops an unbounded table from becoming thousands of
+        sequential calls; `RowPage.truncated` says it was hit, because a partial table that reads as a
+        whole one is the failure worth preventing.
+        """
+        rows, offset, total = RowPage(), 0, None
         while True:
             res = self.call(f"{entity}.list", {"limit": page, "offset": offset, **filters})
             batch = res.get("data", []) if isinstance(res, dict) else res
-            rows.extend(batch)
-            total = res.get("total") if isinstance(res, dict) else None
+            total = res.get("total") if isinstance(res, dict) else total
+            rows.extend(batch[:max(0, max_rows - len(rows))])
             offset += len(batch)
+            if len(rows) >= max_rows:
+                # A table of exactly max_rows was read whole: truncation is about what was left behind.
+                rows.total = total if total is not None else len(rows)
+                rows.truncated = rows.total > len(rows)
+                return rows
             if not batch or len(batch) < page or (total is not None and offset >= total):
+                rows.total = total if total is not None else len(rows)
+                rows.truncated = rows.total > len(rows)
                 return rows
 
 

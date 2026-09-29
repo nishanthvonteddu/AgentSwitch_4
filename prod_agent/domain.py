@@ -13,6 +13,12 @@ from .mcp_client import McpClient, McpError
 OPEN_WO = {"draft", "not_started", "in_progress", "stopped"}
 OPEN_MR = {"draft", "submitted", "partially_ordered", "ordered"}
 DONE_SCO = {"completed", "cancelled"}
+# Narrowing these status scans at the server would cut the transfer sharply: `.list` reads a
+# comma-separated value as OR on REST (seen in the platform UI's own traffic, 2026-09-18). NOT done,
+# because it is unverified over MCP, and the failure mode is silent — a CSV the server does not accept
+# matches nothing, returns zero rows, and the Python status check below never runs to catch it.
+# Verify against a live tenant before pushing these filters down.
+
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
 # Signals whose ready date is unknown: no reschedule date can honestly be committed.
@@ -137,7 +143,7 @@ def _rest_status(mcp: McpClient, entity: str) -> int | None:
 
 def company_context(mcp: McpClient) -> dict:
     """Country and currency come from data, never from assumptions about which book we are in."""
-    companies = mcp.list_all("Company")
+    companies = mcp.call("Company.list", {"limit": 1}).get("data", [])
     wo = mcp.call("WorkOrder.list", {"limit": 1}).get("data", [])
     company_id = wo[0]["company_id"] if wo else (companies[0]["id"] if companies else None)
     c = mcp.call("Company.get", {"id": company_id}) if company_id else {}
