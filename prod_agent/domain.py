@@ -773,6 +773,71 @@ def record_finding(mcp: McpClient, run_id: str, finding: dict) -> dict:
     })
     return {"agent_memory_id": row.get("id"), "run_id": run_id}
 
+# --------------------------------------------------------------------------- generic reads
+
+# The specific tools above encode judgement a raw row does not carry (blocking vs contributing,
+# "potential" never "confirmed", a verdict that may not say yes). query_records exists only for
+# questions none of them answers; the prompt keeps it a fallback. Everything here is read-only.
+QUERY_MAX_ROWS = 200            # never hand the model more than this in one call
+QUERY_NARROW_ABOVE = 2000       # above this, return the count and refuse to page
+
+# `.list` accepts these alongside real field names; they shape the page rather than filter it.
+_QUERY_CONTROLS = {"limit", "offset", "sort_by", "sort_order", "search"}
+
+
+def query_records(mcp: McpClient, entity: str, filters: dict | None = None,
+                  limit: int = 50, sort_by: str | None = None, newest_first: bool = True) -> dict:
+    """Read rows of one entity this seat may see, always bounded and always saying what was not returned.
+
+    Counts before it fetches: a counting question costs one call and no rows, and a million matches
+    costs the same. `total` is returned beside every page so the model cannot mistake a page for the
+    whole table — the failure this exists to prevent.
+    """
+    filters = {k: v for k, v in (filters or {}).items() if v is not None and k not in _QUERY_CONTROLS}
+    # limit=0 is the platform's own count-only idiom, so keep it meaning that rather than "unset".
+    limit = 0 if limit == 0 else max(1, min(int(limit or 50), QUERY_MAX_ROWS))
+
+    if not mcp.has_tool(f"{entity}.list"):
+        # Reuse the probe that already distinguishes a wrong name from a real seat limit.
+        return {"entity": entity, "error": "not readable by this seat", **seat_capability(mcp, f"{entity}.list")}
+
+    page = {"limit": 1, **filters}
+    if sort_by:
+        page.update({"sort_by": sort_by, "sort_order": "desc" if newest_first else "asc"})
+    try:
+        probe = mcp.call(f"{entity}.list", page)
+    except McpError as e:
+        # The platform names the offending filter ("Unknown filter 'x' for Y"), which is worth passing through:
+        # closed schemas mean a wrong field name fails loudly rather than returning every row.
+        return {"entity": entity, "error": e.message, "filters_sent": sorted(filters),
+                "instruction": "check the field name against a row you have already seen, then call again"}
+
+    total = probe.get("total") if isinstance(probe, dict) else None
+    if total is None:
+        total = len(probe.get("data", []) if isinstance(probe, dict) else probe or [])
+
+    result = {"entity": entity, "filters": filters, "total": total}
+    if total == 0:
+        return {**result, "returned": 0, "rows": [], "truncated": False}
+    if total > QUERY_NARROW_ABOVE:
+        # Paging this would cost total/200 sequential calls and overflow the context either way.
+        return {**result, "returned": 0, "rows": [], "truncated": True, "too_many": True,
+                "instruction": f"{total} records match. Add filters (status, a date with lt:/gte:/between:, an id) "
+                               "and call again, or tell the user the set is too large to read and what would narrow it."}
+
+    if limit == 0:
+        return {**result, "returned": 0, "rows": [], "truncated": total > 0, "count_only": True}
+
+    rows = mcp.call(f"{entity}.list", {**page, "limit": min(limit, total)}).get("data", [])
+    truncated = total > len(rows)
+    out = {**result, "returned": len(rows), "rows": rows, "truncated": truncated}
+    if truncated:
+        out["instruction"] = (f"these are {len(rows)} of {total} matching records, ordered by "
+                              f"{sort_by or 'server default'}. Say so rather than presenting them as all of them, "
+                              "and never total or average over them as though they were the whole set.")
+    return out
+
+
 # --- Stopped/finished orders are never late ---------------------------------
 NOT_LATE_STATUSES = {"stopped", "cancelled", "canceled", "completed", "closed"}
 

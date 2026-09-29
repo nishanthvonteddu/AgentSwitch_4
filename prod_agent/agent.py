@@ -30,6 +30,7 @@ How you work:
 - Do not accept a false premise. If the user says an order is late but diagnose_work_order shows is_late=false, say it is not past due (record is_late=false) and still report what is holding it.
 - Costs: expected_cost and actual_cost are on the work order (diagnose_work_order). Variance = actual - expected, in the company currency. If both are 0 or missing, no cost has been recorded: say so and do not compute a variance (cost=null, outcome partial or refused).
 - Platform names: job cards = JobCard, downtime log = DowntimeEntry, engineering changes = EngineeringChangeOrder, sales/customer orders = SalesOrder, purchase orders and receipt dates = PurchaseOrder, stock movements = StockEntry, operators/people and their contact details = Employee, payroll = SalarySlip (another app). For anything else call seat_entities. Before refusing for lack of access, confirm with seat_capability on the REAL entity, and put that exact entity name in not_visible. If seat_capability returns outside_seat, that entity is a real limit: put it in not_visible. If it returns entity_in_catalogue, the entity IS visible (you only guessed the operation name): never list it in not_visible. If it returns a warning, you used a wrong name: retry with a real one.
+- For anything no tool above covers ("how many X", "show me Y", "which Z have..."): run query_records. It is a FALLBACK, never a substitute: if a specific tool fits the question, that tool is the answer, because it carries judgement raw rows do not. query_records returns raw rows, not a conclusion. It returns total beside the rows: when truncated is true you are seeing part of the set, so say so and never total or average over a page as though it were all of it. When too_many is true nothing was read: narrow the filters or tell the user what would narrow them. You may chain it (read ids from one entity, then look them up in another), but say which links you made.
 - Refuse when the data cannot support an answer or the seat is not permitted: the work order does not exist, the entity is not visible, or the requested change is outside this seat (for example changing a sales order delivery date, cancelling a work order, or reading payroll). Refusing correctly is a success, not a failure.
 - Before your final answer you MUST call record_finding exactly once with the structured result, including outcome "refused" when you refuse.
 Final answer: short, plain language, sections Why late / What it blocks / Rescheduling / Not visible to me."""
@@ -172,6 +173,16 @@ class ProductionAgent:
             _fn("seat_capability", "Check whether this seat can use a platform tool, e.g. 'SalesOrder.update', 'DowntimeEntry.list', 'SalarySlip.list'.",
                 {"tool": {"type": "string"}}, ["tool"]),
             _fn("seat_policy_conformance", "The agent policy the platform DECLARES for this seat (allowed domains, denied entities, what needs human approval) and where this seat's observed reach diverges from it."),
+            _fn("query_records", "FALLBACK read for questions no tool above answers: rows of one entity this seat may see. "
+                                 "Returns total beside the rows, so a page is never all of them. Read-only; never use it for "
+                                 "a question a specific tool covers.",
+                {"entity": {"type": "string", "description": "exact entity name, e.g. WorkOrder, BOM, JobCard (seat_entities lists them)"},
+                 "filters": {"type": "object", "description": "field=value; CSV means OR (status=draft,not_started); "
+                                                              "dates take lt:/gte:/between: (planned_end_date=lt:2026-09-29)"},
+                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "rows to return, capped at 200"},
+                 "sort_by": {"type": ["string", "null"], "description": "field to order by"},
+                 "newest_first": {"type": "boolean", "description": "descending when sorting; default true"}},
+                ["entity"]),
             _fn("record_finding", "Persist the structured result. Call exactly once, before the final answer.",
                 RECORD_FINDING_SCHEMA["properties"], RECORD_FINDING_SCHEMA["required"]),
         ]
@@ -190,7 +201,8 @@ class ProductionAgent:
     # re-proposing refreshes updated_at in a shared book.
     REPEAT_GUARDED = {"company_context", "list_late_work_orders", "diagnose_work_order", "downstream_impact",
                       "downtime_summary", "seat_entities", "seat_capability", "capacity_outlook",
-                      "order_feasible_by", "shop_floor_exceptions", "seat_policy_conformance"}
+                      "order_feasible_by", "shop_floor_exceptions", "seat_policy_conformance",
+                      "query_records"}
 
     def _repeat_note(self, name: str, args: dict, step: int) -> dict | None:
         """Stop the model looping on an identical read (seen live: 9 identical seat_capability calls)."""
@@ -253,6 +265,10 @@ class ProductionAgent:
             return domain.seat_capability(self.mcp, args["tool"])
         if name == "seat_policy_conformance":
             return domain.seat_policy_conformance(self.mcp)
+        if name == "query_records":
+            return domain.query_records(self.mcp, args["entity"], args.get("filters"),
+                                        args.get("limit", 50), args.get("sort_by"),
+                                        args.get("newest_first", True))
         if name == "apply_reschedule" and self.apply_mode:
             if self.conflicts:
                 return {"outcome": "refused", "detail": f"not retrying: {', '.join(self.conflicts)} changed underneath this run; "
@@ -315,7 +331,8 @@ class ProductionAgent:
     # qualifies: it only ever appends to _proposals and needs_person. The writes (apply_reschedule, escalate,
     # record_finding) stay serial — each gates on state the others must not race.
     PARALLEL_SAFE = {"company_context", "list_late_work_orders", "diagnose_work_order", "downstream_impact",
-                     "propose_reschedule", "downtime_summary", "seat_entities", "seat_capability"}
+                     "propose_reschedule", "downtime_summary", "seat_entities", "seat_capability",
+                     "query_records"}
     MAX_PARALLEL = 8
 
     def _invoke(self, call, note: dict | None) -> tuple[dict, str | None, float, str | None]:
