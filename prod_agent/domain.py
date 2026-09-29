@@ -13,11 +13,16 @@ from .mcp_client import McpClient, McpError
 OPEN_WO = {"draft", "not_started", "in_progress", "stopped"}
 OPEN_MR = {"draft", "submitted", "partially_ordered", "ordered"}
 DONE_SCO = {"completed", "cancelled"}
-# Narrowing these status scans at the server would cut the transfer sharply: `.list` reads a
-# comma-separated value as OR on REST (seen in the platform UI's own traffic, 2026-09-18). NOT done,
-# because it is unverified over MCP, and the failure mode is silent — a CSV the server does not accept
-# matches nothing, returns zero rows, and the Python status check below never runs to catch it.
-# Verify against a live tenant before pushing these filters down.
+def _csv(statuses: set[str]) -> str:
+    """`.list` reads a comma-separated value as OR, so a status set narrows at the server.
+
+    Confirmed over MCP on Suryodaya 2026-09-29: status=draft,not_started returned 78, exactly
+    draft (40) + not_started (38). Date operators are NOT available on this interface — the tool
+    schema declares planned_end_date as {"format": "date"} and rejects lt:/gte:/between:, though
+    REST accepts them on the same login. The Python status checks stay regardless.
+    """
+    return ",".join(sorted(statuses))
+
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
@@ -188,7 +193,7 @@ def list_late_work_orders(mcp: McpClient) -> list[dict]:
     today = config.today()
     sched = {o["work_order_id"]: o for o in finite_schedule(mcp).get("orders", [])}
     late = []
-    for wo in mcp.list_all("WorkOrder"):
+    for wo in mcp.list_all("WorkOrder", status=_csv(OPEN_WO)):
         if wo.get("status") not in OPEN_WO:
             continue
         due = _date(wo.get("planned_end_date"))
@@ -353,7 +358,7 @@ def diagnose(mcp: McpClient, ref: str) -> dict:
             sig("workstation_downtime_recorded", station, since=_iso(since), **t)
 
     if eco_readable:
-        for e in mcp.list_all("EngineeringChangeOrder"):
+        for e in mcp.list_all("EngineeringChangeOrder", status=_csv(PENDING_ECO)):
             hits = [a for a in (e.get("affected_work_orders") or []) if a.get("work_order_id") == wid]
             if hits and e.get("status") in PENDING_ECO:
                 sig("engineering_change_pending", e.get("number"), status=e.get("status"), action=hits[0].get("action"),
@@ -380,7 +385,7 @@ def downstream_impact(mcp: McpClient, ref: str, max_depth: int = 3) -> dict:
     wo = resolve_work_order(mcp, ref)
     if not wo:
         return {"found": False, "ref": ref}
-    open_wos = [w for w in mcp.list_all("WorkOrder") if w.get("status") in OPEN_WO]
+    open_wos = [w for w in mcp.list_all("WorkOrder", status=_csv(OPEN_WO)) if w.get("status") in OPEN_WO]
     bom_inputs = {b["id"]: {m.get("item_id") for m in (b.get("materials") or [])} for b in mcp.list_all("BOM")}
 
     # item consumed -> the open orders whose BOM consumes it, so the walk below is a lookup per node
@@ -611,7 +616,7 @@ def capacity_outlook(mcp: McpClient, horizon_days: int = 21) -> dict:
     res = mcp.call("endpoint.manufacturing.capacity_board", {"horizon_days": int(horizon_days)})
     board = res.get("result", res) or {}
     counts = board.get("counts") or {}
-    cards = [c for c in mcp.list_all("JobCard") if c.get("status") in OPEN_JOB_CARD]
+    cards = [c for c in mcp.list_all("JobCard", status=_csv(OPEN_JOB_CARD)) if c.get("status") in OPEN_JOB_CARD]
     stations = {w["id"]: w for w in mcp.list_all("Workstation")}
 
     booked = counts.get("booked_minutes")
@@ -661,7 +666,8 @@ def order_feasible_by(mcp: McpClient, ref: str, due: str) -> dict:
         return {"found": True, "work_order": wo.get("number"), "verdict": "unknown",
                 "reason": f"could not read {due!r} as a date"}
     today = config.today()
-    cards = [c for c in mcp.list_all("JobCard", work_order_id=wo["id"]) if c.get("status") in OPEN_JOB_CARD]
+    cards = [c for c in mcp.list_all("JobCard", work_order_id=wo["id"], status=_csv(OPEN_JOB_CARD))
+             if c.get("status") in OPEN_JOB_CARD]
     remaining = _work_content_minutes(cards)
     diag = diagnose(mcp, wo.get("number") or ref)
     blocking = list(diag.get("blocking_causes") or [])

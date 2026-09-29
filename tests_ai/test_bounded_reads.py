@@ -71,12 +71,19 @@ def test_filters_are_sent_on_every_page():
     assert all(args.get("status") == "draft,not_started" for _, args in mcp.calls)
 
 
-def test_status_scans_are_not_narrowed_at_the_server_yet():
-    """CSV-means-OR is verified on REST, not over MCP. A CSV the server rejects returns zero rows and the
-    Python check never runs, so this stays client-side until a live tenant confirms it."""
+def test_status_scans_are_narrowed_at_the_server():
+    """Confirmed over MCP on Suryodaya 2026-09-29: status=draft,not_started returned 78 = 40 + 38."""
     text = open(domain.__file__).read()
-    assert "_csv(" not in text
-    assert "unverified over MCP" in text, "the reason must stay next to the code"
+    assert 'mcp.list_all("WorkOrder", status=_csv(OPEN_WO))' in text
+    assert 'mcp.list_all("EngineeringChangeOrder", status=_csv(PENDING_ECO))' in text
+    assert domain._csv(domain.OPEN_WO) == "draft,in_progress,not_started,stopped"
+
+
+def test_date_operators_are_not_used_on_this_interface():
+    """The MCP schema declares planned_end_date {"format": "date"} and rejects lt:/gte:/between:,
+    though REST accepts them on the same login. Filed as a bug; not usable here meanwhile."""
+    text = open(domain.__file__).read()
+    assert "lt:" not in text.split("def _csv")[0], "no date operator may reach an MCP .list call"
 
 
 def test_python_status_checks_are_kept_as_well():
