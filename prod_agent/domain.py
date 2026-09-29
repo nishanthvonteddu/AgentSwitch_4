@@ -797,6 +797,56 @@ QUERY_NARROW_ABOVE = 2000       # above this, return the count and refuse to pag
 _QUERY_CONTROLS = {"limit", "offset", "sort_by", "sort_order", "search"}
 
 
+QUERY_GROUP_MAX_VALUES = 40      # distinct values reported; the tail is summed into "other"
+QUERY_GROUP_LABEL_CHARS = 80     # an error message is a legitimate group key and can be long
+
+
+def query_group(mcp: McpClient, entity: str, field: str, filters: dict | None = None) -> dict:
+    """Count matching records by one field, over the whole matching set rather than a page.
+
+    A page cannot answer "what were they doing". Seen live 2026-09-29: handed 50 of 1209 failed
+    AgentJob rows, the model reported one error code for all 1209 — the true split was 773/328/107/1.
+    Warning it not to generalise leaves it no way to be right; counting does. MCP exposes no aggregate
+    tool (REST has one), so the rows are walked here and only the counts are returned, which keeps the
+    payload small no matter how many rows were read.
+    """
+    filters = {k: v for k, v in (filters or {}).items() if v is not None and k not in _QUERY_CONTROLS}
+    if not mcp.has_tool(f"{entity}.list"):
+        return {"entity": entity, "error": "not readable by this seat", **seat_capability(mcp, f"{entity}.list")}
+    try:
+        rows = mcp.list_all(entity, **filters)
+    except McpError as e:
+        return {"entity": entity, "error": e.message, "filters_sent": sorted(filters)}
+
+    counts: dict[str, int] = {}
+    missing = 0
+    for r in rows:
+        value = r.get(field)
+        if value is None or value == "":
+            missing += 1
+            continue
+        label = str(value)
+        if len(label) > QUERY_GROUP_LABEL_CHARS:
+            label = label[:QUERY_GROUP_LABEL_CHARS] + "…"
+        counts[label] = counts.get(label, 0) + 1
+
+    ranked = sorted(counts.items(), key=lambda kv: -kv[1])
+    groups = dict(ranked[:QUERY_GROUP_MAX_VALUES])
+    tail = sum(n for _, n in ranked[QUERY_GROUP_MAX_VALUES:])
+    out = {"entity": entity, "filters": filters, "group_by": field,
+           "scanned": len(rows), "total": rows.total, "groups": groups,
+           "distinct_values": len(ranked), "complete": not rows.truncated}
+    if tail:
+        out["other_values_combined"] = tail
+    if missing:
+        out["rows_with_no_value"] = missing
+    if rows.truncated:
+        out["instruction"] = (f"counted {len(rows)} of {rows.total} matching records — the read stopped at its "
+                              "ceiling, so these counts are a floor, not the full split. Say so, and narrow "
+                              "the filters if an exact split is needed.")
+    return out
+
+
 def query_records(mcp: McpClient, entity: str, filters: dict | None = None,
                   limit: int = 50, sort_by: str | None = None, newest_first: bool = True) -> dict:
     """Read rows of one entity this seat may see, always bounded and always saying what was not returned.
@@ -845,8 +895,11 @@ def query_records(mcp: McpClient, entity: str, filters: dict | None = None,
     out = {**result, "returned": len(rows), "rows": rows, "truncated": truncated}
     if truncated:
         out["instruction"] = (f"these are {len(rows)} of {total} matching records, ordered by "
-                              f"{sort_by or 'server default'}. Say so rather than presenting them as all of them, "
-                              "and never total or average over them as though they were the whole set.")
+                              f"{sort_by or 'server default'}. Say so rather than presenting them as all of them. "
+                              "Never total or average over them, and never say what these records have in common "
+                              "as though it held for all {total}: if you are about to describe the set — a shared "
+                              "error, status, reason, owner or kind — call query_group on that field instead, which "
+                              "counts every matching record.").format(total=total)
     return out
 
 

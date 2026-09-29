@@ -31,6 +31,8 @@ How you work:
 - Do not accept a false premise. If the user says an order is late but diagnose_work_order shows is_late=false, say it is not past due (record is_late=false) and still report what is holding it.
 - Costs: expected_cost and actual_cost are on the work order (diagnose_work_order). Variance = actual - expected, in the company currency. If both are 0 or missing, no cost has been recorded: say so and do not compute a variance (cost=null, outcome partial or refused).
 - Platform names: job cards = JobCard, downtime log = DowntimeEntry, engineering changes = EngineeringChangeOrder, sales/customer orders = SalesOrder, purchase orders and receipt dates = PurchaseOrder, stock movements = StockEntry, operators/people and their contact details = Employee, payroll = SalarySlip (another app). For anything else call seat_entities. Before refusing for lack of access, confirm with seat_capability on the REAL entity, and put that exact entity name in not_visible. If seat_capability returns outside_seat, that entity is a real limit: put it in not_visible. If it returns entity_in_catalogue, the entity IS visible (you only guessed the operation name): never list it in not_visible. If it returns a warning, you used a wrong name: retry with a real one.
+- Any claim about a WHOLE set — "they all failed with X", "most are Y", "the common cause is Z" — must come from query_group, never from rows query_records returned. A page is not the set: seen live, 200 sampled rows all carried one error and the true split across 1209 was 773/328/107/1. If query_records comes back with truncated true, you may quote individual records from it but you may not say what they have in common.
+- If the question is how many, how often, what kinds, or which is most common, run query_group, never query_records. query_group counts every matching record; query_records returns at most a page, and characterising a set from a page is how a confident wrong answer gets made. Report its groups as the counts they are.
 - For anything no tool above covers ("how many X", "show me Y", "which Z have..."): run query_records. It is a FALLBACK, never a substitute: if a specific tool fits the question, that tool is the answer, because it carries judgement raw rows do not. query_records returns raw rows, not a conclusion. It returns total beside the rows: when truncated is true you are seeing part of the set, so say so and never total or average over a page as though it were all of it. When too_many is true nothing was read: narrow the filters or tell the user what would narrow them. You may chain it (read ids from one entity, then look them up in another), but say which links you made.
 - Refuse when the data cannot support an answer or the seat is not permitted: the work order does not exist, the entity is not visible, or the requested change is outside this seat (for example changing a sales order delivery date, cancelling a work order, or reading payroll). Refusing correctly is a success, not a failure.
 - Before your final answer you MUST call record_finding exactly once with the structured result, including outcome "refused" when you refuse.
@@ -244,14 +246,21 @@ class ProductionAgent:
             _fn("seat_capability", "Check whether this seat can use a platform tool, e.g. 'SalesOrder.update', 'DowntimeEntry.list', 'SalarySlip.list'.",
                 {"tool": {"type": "string"}}, ["tool"]),
             _fn("seat_policy_conformance", "The agent policy the platform DECLARES for this seat (allowed domains, denied entities, what needs human approval) and where this seat's observed reach diverges from it."),
+            _fn("query_group", "Count records of one entity BY a field, across every matching record rather than a page. "
+                              "Use this, not query_records, whenever the question is how many / how often / what kinds / "
+                              "which is most common — a page of rows cannot answer those and guessing from one is wrong.",
+                {"entity": {"type": "string", "description": "exact entity name, e.g. WorkOrder, JobCard, AgentJob"},
+                 "field": {"type": "string", "description": "field to count by, e.g. status, priority, reason, error"},
+                 "filters": {"type": "object", "description": "exact field=value only, narrowing what is counted"}},
+                ["entity", "field"]),
             _fn("query_records", "FALLBACK read for questions no tool above answers: rows of one entity this seat may see. "
                                  "Returns total beside the rows, so a page is never all of them. Read-only; never use it for "
                                  "a question a specific tool covers.",
                 {"entity": {"type": "string", "description": "exact entity name, e.g. WorkOrder, BOM, JobCard (seat_entities lists them)"},
-                 "filters": {"type": "object", "description": "exact field=value only, e.g. {\"status\": \"draft\"}. "
-                                                              "One value per field: comma lists and lt:/gte:/between: are "
-                                                              "NOT confirmed on this interface and would match nothing. "
-                                                              "For several values of a field, call once per value."},
+                 "filters": {"type": "object", "description": "field=value, e.g. {\"status\": \"draft\"}. A comma list "
+                                                              "means OR: {\"status\": \"draft,not_started\"} matches either. "
+                                                              "Date comparisons are NOT available here — lt:/gte:/between: are "
+                                                              "rejected by this interface, so filter dates after reading."},
                  "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "rows to return, capped at 200"},
                  "sort_by": {"type": ["string", "null"], "description": "field to order by"},
                  "newest_first": {"type": "boolean", "description": "descending when sorting; default true"}},
@@ -275,7 +284,7 @@ class ProductionAgent:
     REPEAT_GUARDED = {"company_context", "list_late_work_orders", "diagnose_work_order", "downstream_impact",
                       "downtime_summary", "seat_entities", "seat_capability", "capacity_outlook",
                       "order_feasible_by", "shop_floor_exceptions", "seat_policy_conformance",
-                      "query_records"}
+                      "query_records", "query_group"}
 
     def _repeat_note(self, name: str, args: dict, step: int) -> dict | None:
         """Stop the model looping on an identical read (seen live: 9 identical seat_capability calls)."""
@@ -338,6 +347,8 @@ class ProductionAgent:
             return domain.seat_capability(self.mcp, args["tool"])
         if name == "seat_policy_conformance":
             return domain.seat_policy_conformance(self.mcp)
+        if name == "query_group":
+            return domain.query_group(self.mcp, args["entity"], args["field"], args.get("filters"))
         if name == "query_records":
             return domain.query_records(self.mcp, args["entity"], args.get("filters"),
                                         args.get("limit", 50), args.get("sort_by"),
@@ -405,7 +416,7 @@ class ProductionAgent:
     # record_finding) stay serial — each gates on state the others must not race.
     PARALLEL_SAFE = {"company_context", "list_late_work_orders", "diagnose_work_order", "downstream_impact",
                      "propose_reschedule", "downtime_summary", "seat_entities", "seat_capability",
-                     "query_records"}
+                     "query_records", "query_group"}
     MAX_PARALLEL = 8
 
     def _invoke(self, call, note: dict | None) -> tuple[dict, str | None, float, str | None]:
