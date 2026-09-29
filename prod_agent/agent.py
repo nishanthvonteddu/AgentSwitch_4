@@ -195,8 +195,10 @@ class ProductionAgent:
                                  "Returns total beside the rows, so a page is never all of them. Read-only; never use it for "
                                  "a question a specific tool covers.",
                 {"entity": {"type": "string", "description": "exact entity name, e.g. WorkOrder, BOM, JobCard (seat_entities lists them)"},
-                 "filters": {"type": "object", "description": "field=value; CSV means OR (status=draft,not_started); "
-                                                              "dates take lt:/gte:/between: (planned_end_date=lt:2026-09-29)"},
+                 "filters": {"type": "object", "description": "exact field=value only, e.g. {\"status\": \"draft\"}. "
+                                                              "One value per field: comma lists and lt:/gte:/between: are "
+                                                              "NOT confirmed on this interface and would match nothing. "
+                                                              "For several values of a field, call once per value."},
                  "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "rows to return, capped at 200"},
                  "sort_by": {"type": ["string", "null"], "description": "field to order by"},
                  "newest_first": {"type": "boolean", "description": "descending when sorting; default true"}},

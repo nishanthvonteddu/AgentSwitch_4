@@ -170,3 +170,15 @@ def test_agent_exposes_it_as_a_fallback_and_guards_it_like_other_reads():
     assert "query_records" in ProductionAgent.REPEAT_GUARDED
     assert "query_records" in SYSTEM_PROMPT
     assert "FALLBACK" in SYSTEM_PROMPT, "precedence over the specific tools must be stated in the prompt"
+
+
+def test_the_model_is_not_told_to_use_unverified_filter_syntax():
+    """CSV-means-OR and lt:/gte:/between: are verified on REST, not over MCP. A value format the server
+    does not accept matches nothing and returns total 0, which reads as "no such records" — the silent
+    wrong answer this tool exists to avoid. Advertise only equality until a live tenant confirms it."""
+    from prod_agent import agent
+    text = open(agent.__file__).read()
+    i = text.index('"filters": {"type": "object"')
+    described = text[i:i + 500]
+    assert "NOT confirmed" in described
+    assert "call once per value" in described, "the model needs a working alternative, not just a prohibition"
