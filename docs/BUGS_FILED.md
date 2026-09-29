@@ -251,3 +251,46 @@ Swept and clean, recorded so we do not re-check: `planned_end < planned_start` (
 `total_items` / `limit` / `offset` / `complete` at limit 1, 50 and 500). The new endpoints report their own
 limits honestly — `capacity_board` publishes `malformed_workstation_ids`, `finite_schedule` publishes
 `uncosted_item_change_pairs` and a `generic_late_cause_rate` — which is the discipline S29 and N233 asked for.
+
+## 29 September — the MCP filter gate
+
+The filter syntax we backed out of `domain.py` and then out of `query_records`' tool description as "not
+confirmed on this interface" (`8b8d0e0`) is now confirmed, with a cause: the MCP tool schema refuses it,
+the REST layer implements it.
+
+| D1 | Suryodaya (both verified) | 7525f98c-89cd-445c-9908-8cc21e32a068 | Date and numeric range filters (`lt:` `gte:` …) are rejected by the MCP tool schema but work over REST, so no agent can filter by date | - | High | Filed 29 Sep |
+
+**D1 detail.** `WorkOrder.list` over MCP with `planned_end_date: "lt:2026-09-29"` returns `-32602`
+(`/planned_end_date must be a valid date.`); `GET /api/WorkOrder?planned_end_date=lt:2026-09-29` on the same
+login returns 200 and `total: 124` of 147. REST does not merely accept it — all 124 rows satisfy the
+predicate, `lt:` (124) + `gte:` (23) partitions the table exactly with no nulls, and the family is
+arithmetically consistent (`lte` 125 = `lt` 124 + `eq` 1; `gt` 22 = `gte` 23 − `eq` 1). The cause is visible
+in `tools/list`: `"planned_end_date": {"type": "string", "format": "date"}`, so the operator prefix fails
+JSON-Schema validation before dispatch.
+
+**Not only dates.** `"qty": {"type": "number"}` fails the same way: `{"qty": "gt:100"}` gives
+`/qty must be number.` over MCP, while REST returns 46 rows (Suryodaya) / 64 (Keystone). Every date-typed
+argument we tried is refused across entities — `WorkOrder.planned_start_date` / `planned_end_date` /
+`actual_start_date` / `actual_end_date`, `JobCard.planned_end`, `DowntimeEntry.from_time`,
+`MaterialRequest.required_by_date` — and `created_at` is not an accepted MCP argument at all, though REST
+filters on it correctly (`lt:2026-09-01` → 0, `gte:2026-09-01` → 147, earliest row 2026-09-12).
+
+**The query layer behind MCP already honours the operators — the schema is the only gate.** `status` is
+declared `{"type": "string"}` with no `format`, so the prefix survives validation and is then applied:
+`{"status": "ne:completed"}` over MCP returns `total: 101`, which is exactly 147 − 46 completed (Keystone:
+17). This is the same reason CSV was confirmed to work over MCP in `a6804fa` — a loosely-typed field lets the
+grammar through. So the fix is the filter arguments' schema, not the transport, and the report says so, to
+stop "MCP does not support operators" being a valid answer.
+
+**What this changes for us.** `query_records` currently tells the model that `lt:/gte:/between:` are "NOT
+confirmed on this interface", which is right in effect but understates it: on a date or numeric field the
+call is *refused* with a specific error, not silently empty — while on a string field the operator works.
+Worth revisiting that description once D1 is triaged. Until then every date-bounded question reads the whole
+table and filters client-side.
+
+**Severity pitched High, not Medium.** Sibling to N144 (invalid values silently accepted) and B16 (the same
+capability behaving differently through two doors, which the board rated High). This one is the mirror
+image: a valid query refused at the door teams are told to build on.
+
+**Filed on Suryodaya only.** Reproduced identically on Keystone, including the error message, and recorded in
+the report; a Keystone twin in the B13/B13a style has not been filed.

@@ -142,6 +142,7 @@ Output goes to `runs/<timestamp>/<instance>/<task>/`: `task.json`, `fixture.json
 - **SalesOrder:** read-only on both instances (Keystone gained `sales_viewer` on 17 Sep). Read was revoked by the 20 Sep release and restored on 22 Sep — `.list`/`.get` verified on both, `.update` still absent.
 - **Outside the seat:** PurchaseOrder, StockEntry, Employee and payroll (REST 403, not in the catalogue).
 - **Links and locks:** WorkOrder has no parent/child link, so downstream impact comes from a reverse walk of BOM materials. Submitted work orders are date-locked, and cancel is admin-only (no longer listed for this seat).
+- **No date or numeric range filter over MCP (29 Sep):** the MCP tool schema types these arguments (`planned_end_date` as `{"type": "string", "format": "date"}`, `qty` as `number`), so `lt:`/`gte:` are refused with `-32602` before dispatch — while the same filter over REST returns 200 and applies correctly. It is the schema, not the interface: `status` is declared as a plain string, so `ne:`/CSV pass validation and are honoured over MCP. Until this is fixed the agent reads the table and filters client-side. Filed as D1 (`7525f98c`) — see [docs/BUGS_FILED.md](docs/BUGS_FILED.md).
 
 ## Rows this team created on Suryodaya
 
