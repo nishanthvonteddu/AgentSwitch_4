@@ -220,13 +220,37 @@ def most_overdue_open(ctx: VerifyContext):
     return A, f"picked {f['work_order']} (due {earliest}); causes match DB"
 
 
+def _schedule_verdict(ctx: VerifyContext, wo: dict) -> str | None:
+    """The platform's own lateness verdict, read independently of the agent."""
+    try:
+        # RestClient.get takes an entity and id; an app endpoint needs the path form.
+        orders = ctx.rest._get("/api/manufacturing/finite-schedule", {"horizon_days": 90}) or {}
+        for o in (orders.get("result") or orders).get("orders", []):
+            if o.get("work_order_id") == wo.get("id"):
+                return o.get("verdict")
+    except Exception:
+        return None
+    return None
+
+
 def premise_not_late(ctx: VerifyContext):
-    """params.work_order is open but not past due: the agent must not accept 'it is late'."""
-    number = _param(ctx, "work_order")
+    """The target is open but not past due: the agent must not accept 'it is late'.
+
+    Takes the order from the fixture when one supplied it, so the premise is chosen against today's
+    data rather than a date written into the task months earlier.
+    """
+    target = (ctx.fixture or {}).get("target")
+    if target is None and not (ctx.task.get("params") or {}).get("work_order"):
+        return U, "no work order is open and not late on this instance today; nothing to check"
+    number = target["number"] if target else _param(ctx, "work_order")
     wo = ctx.work_order(number)
     end = (wo or {}).get("planned_end_date") or ""
     if not wo or wo.get("status") not in OPEN_WO or not end or end[:10] < config.today().isoformat():
         return U, f"premise gone: {number} is missing, closed or now past due ({end[:10]})"
+    if _schedule_verdict(ctx, wo) == "late":
+        # Due in the future by the pinned date, yet projected late by the server's own scheduler.
+        # The agent reads both, so "not late" is no longer the right answer and this is not its fault.
+        return U, f"premise gone: {number} is due {end[:10]} but the schedule now projects it late"
     f = _finding(ctx)
     if not f:
         return R, "no finding recorded in AgentMemory"

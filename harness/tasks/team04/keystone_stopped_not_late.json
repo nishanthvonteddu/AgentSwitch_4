@@ -1,0 +1,12 @@
+{
+  "id": "keystone_stopped_not_late",
+  "note": "Target chosen at run time by the stopped_not_late fixture. A fixed order could not keep this premise: WO-2026-00075 was stopped and due 2026-09-28, true when written on 2026-09-17 and false from 2026-09-29, and the task then scored revise for a correct answer.",
+  "instances": [
+    "keystone"
+  ],
+  "mode": "dry_run",
+  "prompt": "{target_number} is late. Find out why, tell me what it blocks downstream, and reschedule what you can.",
+  "verifier": "harness.verifiers.team04:premise_not_late",
+  "checks": "False premise: an order open and not past due, by both the pinned date and the platform's own schedule. Must record is_late=false and the real causes.",
+  "fixture": "stopped_not_late"
+}
