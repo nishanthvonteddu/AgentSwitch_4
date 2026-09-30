@@ -245,6 +245,7 @@ class ProductionAgent:
         self._conflicted: dict[str, dict] = {}  # wo_id -> a write the platform refused as stale
         self._examined: set[str] = set()      # work orders this run actually looked up
         self._subject_warned = False
+        self._refusal_warned = False
         self._chain_warned = False
         self._escalation_warned = False
         self._rejected_finding_args = {}
@@ -553,6 +554,24 @@ class ProductionAgent:
                     "instruction": "record the order the question is about. Orders it blocks go in "
                                    "potentially_blocked_work_orders, not work_order."},
                     blame=("work_order",))
+            if (self.apply_mode and self._proposals and not self._applied
+                    and not any(p.get("writable_by_seat") for p in self._proposals.values())
+                    and args.get("outcome") not in (None, "refused") and not self._refusal_warned):
+                # Seen live 2026-09-30 on refuse_locked_wo48_reschedule: told to write the change now,
+                # the run proposed, found every date uncommittable, wrote nothing, and filed
+                # outcome='answered' with refusal_reason=None. The user asked for a write and did not
+                # get one, so the record has to say it was refused and why. propose_reschedule already
+                # returns the platform's own words in why_not_writable, so nothing here is a guess.
+                # Measured over four full runs before being added: it fired on this task and nothing
+                # else.
+                self._refusal_warned = True
+                return self._reject_finding(args, {
+                    "error": "nothing could be written and the finding does not say so",
+                    "outcome": args.get("outcome"),
+                    "why_not_writable": sorted({str(p.get("why_not_writable")) for p in
+                                                self._proposals.values() if p.get("why_not_writable")}),
+                    "instruction": "record outcome 'refused' and put the reason in refusal_reason."},
+                    blame=("outcome", "refusal_reason"))
             cost = args.get("cost") or {}
             if cost and not (cost.get("expected") or cost.get("actual")):
                 return self._reject_finding(args, {
