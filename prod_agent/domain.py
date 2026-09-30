@@ -1020,19 +1020,3 @@ def query_records(mcp: McpClient, entity: str, filters: dict | None = None,
                               "error, status, reason, owner or kind — call query_group on that field instead, which "
                               "counts every matching record. " + nextstep).format(total=total)
     return out
-
-
-# --- Stopped/finished orders are never late ---------------------------------
-NOT_LATE_STATUSES = {"stopped", "cancelled", "canceled", "completed", "closed"}
-
-_diagnose_original = diagnose
-
-
-def diagnose(mcp, ref, *args, **kwargs):
-    result = _diagnose_original(mcp, ref, *args, **kwargs)
-    if isinstance(result, dict):
-        wo = result.get("work_order") or {}
-        status = str(wo.get("status") or "").strip().lower()
-        if status in NOT_LATE_STATUSES:
-            result["is_late"] = False
-    return result

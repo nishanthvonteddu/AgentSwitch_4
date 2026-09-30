@@ -572,7 +572,12 @@ def escalation_raised_for(ctx: VerifyContext):
     f = _finding(ctx)
     if not f:
         return R, "no finding recorded in AgentMemory"
-    recorded = [e for e in f.get("escalations") or [] if e.get("raised")]
+    # A finding whose escalations are not objects is a bad answer, not a broken verifier: score it
+    # revise rather than raising, because unevaluated never counts as a pass.
+    entries = f.get("escalations") or []
+    if not all(isinstance(e, dict) for e in entries):
+        return R, f"finding recorded escalations in the wrong shape: {json.dumps(entries)[:120]}"
+    recorded = [e for e in entries if e.get("raised")]
     if not any(e.get("number") == esc.get("number") for e in recorded):
         return R, f"finding does not record {esc.get('number')}"
     return A, f"{esc.get('number')} raised to {esc.get('assignee_display')} ({esc.get('reason_code')}), recorded in finding"
