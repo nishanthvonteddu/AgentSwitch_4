@@ -244,6 +244,7 @@ class ProductionAgent:
         self._applied: set[str] = set()
         self._chain_warned = False
         self._escalation_warned = False
+        self._rejected_finding_args = {}
         self.escalate_mode = escalate_mode
         self.session_title = session_title or f"team04 production agent run {self.run_id}"
         self.max_escalations = max_escalations
@@ -370,6 +371,32 @@ class ProductionAgent:
             return {"type": "function", "function": {"name": "record_finding"}}
         return None
 
+    def _reject_finding(self, args: dict, payload: dict, blame=()) -> dict:
+        """Refuse this attempt, but keep what it got right for the retry.
+
+        Every guard here tells the model to call record_finding again, and the model answers by
+        building a fresh payload rather than amending the old one. Seen live 2026-09-30 on
+        most_overdue_open_why_late: the first attempt carried contributing_causes
+        ['stopped_without_recorded_reason', 'operation_not_started'], the cost guard refused it, and
+        the retry fixed cost and dropped contributing_causes entirely. The finding persisted was
+        missing a cause the database proves, so a rejection meant to improve the answer made it worse.
+
+        The fields named in `blame` are exactly what the model was asked to change, so they are not
+        carried over — restoring the value that caused the refusal would refuse the retry forever.
+        """
+        self._rejected_finding_args = {k: v for k, v in args.items() if k not in set(blame)}
+        return payload
+
+    def _restore_dropped(self, args: dict) -> dict:
+        """Fill back fields an earlier attempt supplied and this one silently dropped."""
+        if not self._rejected_finding_args:
+            return args
+        merged = dict(args)
+        for field, value in self._rejected_finding_args.items():
+            if merged.get(field) is None:
+                merged[field] = value
+        return merged
+
     def _dispatch(self, name: str, args: dict):
         ref = args.get("work_order")
         if name == "company_context":
@@ -451,24 +478,30 @@ class ProductionAgent:
         if name == "record_finding":
             if self.finding is not None:
                 return {"error": "finding already recorded for this run"}
+            args = self._restore_dropped(args)
             mistyped = _mistyped(args)
             if mistyped:
                 # A wrong shape reaches the database and takes the verifier down with it, which scores
                 # unevaluated rather than revise: worse than a wrong answer, because nothing checked it.
-                return {"error": "these fields have the wrong shape", "fields": mistyped,
-                        "instruction": "call record_finding again with each listed field in the shape its "
-                                       "schema declares"}
+                return self._reject_finding(args, {
+                    "error": "these fields have the wrong shape", "fields": mistyped,
+                    "instruction": "call record_finding again with each listed field in the shape its "
+                                   "schema declares"}, blame=mistyped)
             nulled = _nulled_required(args)
             if nulled:
                 # The schema is sent to the model but was never checked on the way back, so a model that
                 # sent null for a non-nullable field (seen live 2026-09-22: outcome=null on a refusal, which
                 # the verifier scored revise) had that gap persisted and the run reported success.
-                return {"error": "these fields cannot be null", "fields": nulled,
-                        "instruction": "call record_finding again with a real value for each listed field"}
+                return self._reject_finding(args, {
+                    "error": "these fields cannot be null", "fields": nulled,
+                    "instruction": "call record_finding again with a real value for each listed field"},
+                    blame=nulled)
             cost = args.get("cost") or {}
             if cost and not (cost.get("expected") or cost.get("actual")):
-                return {"error": "cost must be null when no cost is recorded (expected and actual are 0 or missing)",
-                        "instruction": "record cost=null, say no cost has been recorded, and use outcome partial or refused"}
+                return self._reject_finding(args, {
+                    "error": "cost must be null when no cost is recorded (expected and actual are 0 or missing)",
+                    "instruction": "record cost=null, say no cost has been recorded, and use outcome partial "
+                                   "or refused"}, blame=("cost",))
             pending = self._unapplied_chain(args)
             if pending and not self._chain_warned:
                 # Four prompt wordings did not stop the model applying the order the user named and
@@ -478,21 +511,23 @@ class ProductionAgent:
                 # storm of writes the approval gate was always going to refuse. Warned once only, because
                 # a second refusal can end the run with no finding, which scores unevaluated.
                 self._chain_warned = True
-                return {"error": "the chain is left inconsistent",
-                        "unapplied": pending,
-                        "instruction": "call apply_reschedule for each work_order_id listed, then record "
-                                       "the finding. If one should not be written, record it in rescheduled "
-                                       "with an outcome saying so."}
+                return self._reject_finding(args, {
+                    "error": "the chain is left inconsistent",
+                    "unapplied": pending,
+                    "instruction": "call apply_reschedule for each work_order_id listed, then record "
+                                   "the finding. If one should not be written, record it in rescheduled "
+                                   "with an outcome saying so."})
             if self.escalate_mode and self.needs_person and not self.escalations and not self._escalation_warned:
                 # Asked once, not forever. Refusing every attempt ends the run with no finding at all —
                 # seen live 2026-09-29 on concurrent_edit_before_write, refused twice and filed nothing,
                 # which scores revise for an empty database rather than for a weak answer. The handover
                 # still matters, so the model is told plainly; it is not held hostage over it.
                 self._escalation_warned = True
-                return {"error": "escalation required before recording the finding",
-                        "needs_person": self.needs_person,
-                        "instruction": "call escalate once (work order, records checked, what is missing, action "
-                                       "requested), then call record_finding with its result in escalations"}
+                return self._reject_finding(args, {
+                    "error": "escalation required before recording the finding",
+                    "needs_person": self.needs_person,
+                    "instruction": "call escalate once (work order, records checked, what is missing, action "
+                                   "requested), then call record_finding with its result in escalations"})
             self.finding = args
             self.finding_record = domain.record_finding(self.mcp, self.run_id, args)
             return self.finding_record
