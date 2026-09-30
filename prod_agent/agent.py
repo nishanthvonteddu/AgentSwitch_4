@@ -241,7 +241,8 @@ class ProductionAgent:
         self.trace = trace or (lambda event: None)
         self.max_steps = max_steps
         self._proposals: dict[str, dict] = {}
-        self._applied: set[str] = set()
+        self._applied: dict[str, dict] = {}   # wo_id -> the write the platform confirmed
+        self._conflicted: dict[str, dict] = {}  # wo_id -> a write the platform refused as stale
         self._chain_warned = False
         self._escalation_warned = False
         self._rejected_finding_args = {}
@@ -371,6 +372,32 @@ class ProductionAgent:
             return {"type": "function", "function": {"name": "record_finding"}}
         return None
 
+    def _reconcile_rescheduled(self, args: dict) -> dict:
+        """Replace hand-copied reschedule entries with the writes the platform confirmed.
+
+        Seen live 2026-09-30 on reschedule_fixture_chain: both orders were rescheduled correctly, and
+        the finding then carried two entries both numbered WO-2026-00170, the first holding
+        WO-2026-00169's dates. Nothing was wrong with the work — the model simply mistyped the list
+        while rewriting it for a third attempt, and the run scored revise for a write it had made.
+
+        The same run recorded a write the platform had refused as stale under the outcome 'conflict',
+        where the verifier — and anyone reading the record later — needs the platform's own word,
+        changed_underneath. Both are the model retyping something the loop already holds exactly.
+
+        apply_reschedule returns what the platform stored, or why it refused, so the model is not the
+        source of either. Its own entries survive only where they describe an order this run never
+        wrote to: one deliberately left alone, or a refusal it wants on the record.
+        """
+        truth = list(self._applied.values()) + list(self._conflicted.values())
+        if not truth:
+            return args
+        known = {r["number"] for r in truth}
+        kept = [r for r in (args.get("rescheduled") or [])
+                if isinstance(r, dict) and str(r.get("number")) not in known]
+        merged = dict(args)
+        merged["rescheduled"] = truth + kept
+        return merged
+
     def _reject_finding(self, args: dict, payload: dict, blame=()) -> dict:
         """Refuse this attempt, but keep what it got right for the retry.
 
@@ -453,8 +480,15 @@ class ProductionAgent:
                 return {"outcome": "not_approved", "number": p["number"]}
             result = domain.apply_proposal(self.mcp, p, self.allowed_write_ids)
             if result.get("outcome") == "applied":
-                self._applied.add(args["work_order_id"])
+                self._applied[args["work_order_id"]] = {
+                    "number": result.get("number") or p["number"],
+                    "new_start": result.get("planned_start_date") or p.get("new_start"),
+                    "new_end": result.get("planned_end_date") or p.get("new_end"),
+                    "outcome": "applied"}
             if result.get("outcome") == "changed_underneath":
+                self._conflicted[args["work_order_id"]] = {
+                    "number": p["number"], "new_start": p.get("new_start"),
+                    "new_end": p.get("new_end"), "outcome": "changed_underneath"}
                 self.conflicts.append(p["number"])
                 self.needs_person.append(f"{p['number']}: changed by someone else during this run")
             return result
@@ -479,6 +513,7 @@ class ProductionAgent:
             if self.finding is not None:
                 return {"error": "finding already recorded for this run"}
             args = self._restore_dropped(args)
+            args = self._reconcile_rescheduled(args)
             mistyped = _mistyped(args)
             if mistyped:
                 # A wrong shape reaches the database and takes the verifier down with it, which scores
