@@ -35,8 +35,13 @@ def late_draft_chain(mcp: McpClient) -> dict:
         "upstream": (today - dt.timedelta(days=10), today - dt.timedelta(days=3)),
         "downstream": (today + dt.timedelta(days=1), today + dt.timedelta(days=4)),
     }
+    # `search` on WorkOrder.list matches the number column only, not notes: checked live 2026-09-29,
+    # search="team04-harness" returned 0 while 48 rows carried it in notes. Relying on it meant the
+    # fixtures never found themselves and a fresh pair was created every run — 24 pairs had piled up
+    # on a shared book, and the verifier then graded an orphan from an earlier run instead of this
+    # one's. Scan notes instead, newest first, so a reused pair is the most recent one.
     existing = {}
-    for wo in mcp.list_all("WorkOrder", search=config.HARNESS_MARKER):
+    for wo in sorted(mcp.list_all("WorkOrder"), key=lambda w: w.get("number") or "", reverse=True):
         notes = wo.get("notes") or ""
         if MARK in notes and wo.get("status") == "draft":
             existing.setdefault("upstream" if "role:upstream" in notes else "downstream", wo)

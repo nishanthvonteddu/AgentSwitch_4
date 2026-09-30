@@ -241,6 +241,8 @@ class ProductionAgent:
         self.trace = trace or (lambda event: None)
         self.max_steps = max_steps
         self._proposals: dict[str, dict] = {}
+        self._applied: set[str] = set()
+        self._chain_warned = False
         self.escalate_mode = escalate_mode
         self.session_title = session_title or f"team04 production agent run {self.run_id}"
         self.max_escalations = max_escalations
@@ -418,6 +420,8 @@ class ProductionAgent:
             if not approved:
                 return {"outcome": "not_approved", "number": p["number"]}
             result = domain.apply_proposal(self.mcp, p, self.allowed_write_ids)
+            if result.get("outcome") == "applied":
+                self._applied.add(args["work_order_id"])
             if result.get("outcome") == "changed_underneath":
                 self.conflicts.append(p["number"])
                 self.needs_person.append(f"{p['number']}: changed by someone else during this run")
@@ -460,6 +464,20 @@ class ProductionAgent:
             if cost and not (cost.get("expected") or cost.get("actual")):
                 return {"error": "cost must be null when no cost is recorded (expected and actual are 0 or missing)",
                         "instruction": "record cost=null, say no cost has been recorded, and use outcome partial or refused"}
+            pending = self._unapplied_chain(args)
+            if pending and not self._chain_warned:
+                # Four prompt wordings did not stop the model applying the order the user named and
+                # stopping, leaving a dependant that starts before its upstream finishes. The guard that
+                # works in this loop is a refusal, as escalation already shows. Limited to ids the caller
+                # permits writing: an earlier version counted every proposal and sent the model into a
+                # storm of writes the approval gate was always going to refuse. Warned once only, because
+                # a second refusal can end the run with no finding, which scores unevaluated.
+                self._chain_warned = True
+                return {"error": "the chain is left inconsistent",
+                        "unapplied": pending,
+                        "instruction": "call apply_reschedule for each work_order_id listed, then record "
+                                       "the finding. If one should not be written, record it in rescheduled "
+                                       "with an outcome saying so."}
             if self.escalate_mode and self.needs_person and not self.escalations:
                 # Guardrail, like record_finding itself: a handover a person must act on is not optional.
                 return {"error": "escalation required before recording the finding",
@@ -470,6 +488,25 @@ class ProductionAgent:
             self.finding_record = domain.record_finding(self.mcp, self.run_id, args)
             return self.finding_record
         return {"error": f"unknown tool {name}"}
+
+    def _unapplied_chain(self, args: dict) -> list[dict]:
+        """Writable proposals whose dates moved, that this run may write and has not accounted for."""
+        if not self.apply_mode or self.conflicts:
+            return []
+        accounted = {str(r.get("number")) for r in (args.get("rescheduled") or []) if isinstance(r, dict)}
+        pending = []
+        for wo_id, p in self._proposals.items():
+            if wo_id in self._applied or not p.get("writable_by_seat"):
+                continue
+            if self.allowed_write_ids is not None and wo_id not in self.allowed_write_ids:
+                continue  # the caller will refuse it; asking the model to try wastes the run
+            if (p.get("new_start"), p.get("new_end")) == (p.get("current_start"), p.get("current_end")):
+                continue
+            if p.get("number") in accounted:
+                continue
+            pending.append({"work_order_id": wo_id, "number": p.get("number"),
+                            "new_start": p.get("new_start"), "new_end": p.get("new_end")})
+        return pending
 
     # Reads that touch no run-critical state, so several of them can be in flight at once. propose_reschedule
     # qualifies: it only ever appends to _proposals and needs_person. The writes (apply_reschedule, escalate,
