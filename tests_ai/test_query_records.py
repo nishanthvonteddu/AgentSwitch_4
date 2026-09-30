@@ -3,6 +3,8 @@
 The failure this tool exists to prevent is a page being reported as the whole table, so most of
 these assert on `total`, `truncated` and `too_many` rather than on the rows themselves.
 """
+import json
+
 import pytest
 
 from prod_agent import domain
@@ -183,3 +185,50 @@ def test_the_filter_description_matches_what_was_verified():
     assert "comma list" in described and "means OR" in described
     assert "NOT available here" in described
     assert "lt:/gte:/between:" in described
+
+
+# --------------------------------------------------------------- size, not row count
+
+def _fat(n, chars=3000):
+    return [{"id": f"id-{i}", "number": f"BOM-{i:05d}", "description": "x" * chars} for i in range(n)]
+
+
+def test_large_rows_are_trimmed_to_what_survives_serialisation():
+    """Live 2026-09-29: 100 BOMs reported as 100 of 100 with truncated false, serialised to 327k, and the
+    60k tool-content limit cut it to ~16. The envelope must count what the model receives, not what was
+    fetched, or it certifies as complete a set it has already lost most of."""
+    mcp = FakeMcp(total=100, rows=_fat(100), tools=("BOM.list",))
+    out = domain.query_records(mcp, "BOM", limit=200)
+    assert out["returned"] < 100
+    assert out["truncated"] is True
+    assert out["dropped_for_size"] == 100 - out["returned"]
+    assert out["size_limited"] is True
+
+
+def test_the_returned_rows_fit_the_budget():
+    out = domain.query_records(FakeMcp(total=100, rows=_fat(100), tools=("BOM.list",)), "BOM", limit=200)
+    assert len(json.dumps(out["rows"], default=str)) <= domain.QUERY_MAX_CHARS + 3200
+
+
+def test_at_least_one_row_comes_back_even_when_it_alone_exceeds_the_budget():
+    out = domain.query_records(FakeMcp(total=5, rows=_fat(5, chars=domain.QUERY_MAX_CHARS * 2), tools=("BOM.list",)), "BOM", limit=5)
+    assert out["returned"] == 1, "returning nothing would be worse than returning one oversized row"
+    assert out["truncated"] is True
+
+
+def test_small_rows_are_not_size_limited():
+    out = domain.query_records(FakeMcp(total=40, rows=_rows(40)), "WorkOrder", limit=200)
+    assert out["returned"] == 40 and out["truncated"] is False
+    assert "dropped_for_size" not in out and "size_limited" not in out
+
+
+def test_size_limited_next_step_does_not_advise_a_bigger_limit():
+    """Asking for more rows cannot help when the constraint is bytes; saying so would send it in a loop."""
+    out = domain.query_records(FakeMcp(total=100, rows=_fat(100), tools=("BOM.list",)), "BOM", limit=200)
+    assert "will NOT return more" in out["next_step"]
+    assert "Narrow the filters" in out["next_step"]
+
+
+def test_row_limited_next_step_does_advise_fetching_the_rest():
+    out = domain.query_records(FakeMcp(total=80, rows=_rows(80)), "WorkOrder", limit=10)
+    assert "limit=80" in out["next_step"]

@@ -793,6 +793,13 @@ def record_finding(mcp: McpClient, run_id: str, finding: dict) -> dict:
 QUERY_MAX_ROWS = 200            # never hand the model more than this in one call
 QUERY_NARROW_ABOVE = 2000       # above this, return the count and refuse to page
 
+# Rows are the wrong unit to cap on: a BOM row carrying its materials and operations is ~3,300
+# characters, a Workstation row ~300. Seen live 2026-09-29: 100 BOMs came back as 100 of 100 with
+# truncated false, serialised to 327k characters, and the 60k tool-content limit then cut it to about
+# 16 rows — the model was told it held every BOM while holding a sixth of them. Budget by size, below
+# the transport limit, so the envelope's own count is the number that actually arrives.
+QUERY_MAX_CHARS = 40000
+
 # `.list` accepts these alongside real field names; they shape the page rather than filter it.
 _QUERY_CONTROLS = {"limit", "offset", "sort_by", "sort_order", "search"}
 
@@ -891,15 +898,45 @@ def query_records(mcp: McpClient, entity: str, filters: dict | None = None,
         return {**result, "returned": 0, "rows": [], "truncated": total > 0, "count_only": True}
 
     rows = mcp.call(f"{entity}.list", {**page, "limit": min(limit, total)}).get("data", [])
+
+    # Trim to what will survive serialisation, so returned/truncated describe what the model receives
+    # rather than what was fetched. Fencing inflates this further upstream, hence the margin.
+    kept, budget = [], QUERY_MAX_CHARS
+    for row in rows:
+        cost = len(json.dumps(row, default=str)) + 2
+        if kept and cost > budget:
+            break
+        kept.append(row)
+        budget -= cost
+    dropped_for_size = len(rows) - len(kept)
+    rows = kept
     truncated = total > len(rows)
     out = {**result, "returned": len(rows), "rows": rows, "truncated": truncated}
+    if dropped_for_size:
+        out["dropped_for_size"] = dropped_for_size
+        out["size_limited"] = True
     if truncated:
+        # Naming the move matters: seen live 2026-09-29, the model was told it held 50 of 100 BOMs and
+        # moved on rather than asking for the rest, so a question answerable from the full set was
+        # answered from half of it. Rows carry their child arrays, so "fetch it all and scan" is often
+        # the whole answer — say so when the set actually fits under the cap.
+        fits = total <= QUERY_MAX_ROWS and not dropped_for_size
+        if dropped_for_size:
+            nextstep = (f"These rows are large, so only {len(rows)} of {total} fit in one reply. Asking for a "
+                        "higher limit will NOT return more. Narrow the filters so fewer records match, or use "
+                        "query_group if you only need counts across the whole set.")
+        elif fits:
+            nextstep = f"All {total} fit in one call: repeat this query with limit={total} to get them all."
+        else:
+            nextstep = (f"{total} will not fit in one call (cap {QUERY_MAX_ROWS}): narrow the filters, "
+                        "or use query_group if you only need counts.")
+        out["next_step"] = nextstep
         out["instruction"] = (f"these are {len(rows)} of {total} matching records, ordered by "
                               f"{sort_by or 'server default'}. Say so rather than presenting them as all of them. "
                               "Never total or average over them, and never say what these records have in common "
                               "as though it held for all {total}: if you are about to describe the set — a shared "
                               "error, status, reason, owner or kind — call query_group on that field instead, which "
-                              "counts every matching record.").format(total=total)
+                              "counts every matching record. " + nextstep).format(total=total)
     return out
 
 
