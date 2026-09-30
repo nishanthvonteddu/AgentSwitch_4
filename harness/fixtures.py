@@ -72,9 +72,6 @@ def late_draft_chain(mcp: McpClient) -> dict:
     return out
 
 
-# Slack between today and the target due date, so a slow run cannot make its own premise false.
-MIN_DUE_MARGIN_DAYS = 5
-
 CONCURRENT_EDIT_NOTE = " | concurrent edit simulated by team04 harness"
 
 
