@@ -785,6 +785,88 @@ def record_finding(mcp: McpClient, run_id: str, finding: dict) -> dict:
     })
     return {"agent_memory_id": row.get("id"), "run_id": run_id}
 
+# --------------------------------------------------------------------------- where used
+
+def resolve_item(mcp: McpClient, ref: str) -> dict | None:
+    """An item by id, code (RM-BOLT-M8), number (ITEM-2026-00011) or exact name.
+
+    Matched locally over the item list rather than through `search`, because an exact comparison is
+    what the caller means and `search` semantics are the platform's to change. Names are unique on
+    both books (checked 2026-09-29), so a name is as safe a key as a code here.
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        return None
+    if UUID_RE.match(ref):
+        try:
+            return mcp.call("Item.get", {"id": ref})
+        except McpError as e:
+            if e.kind == "not_found" or "not found" in e.message.lower():
+                return None
+            raise
+    wanted = ref.casefold()
+    for item in mcp.list_all("Item"):
+        if any((item.get(f) or "").strip().casefold() == wanted for f in ("code", "number", "name")):
+            return item
+    return None
+
+
+def where_is_item_used(mcp: McpClient, item: str) -> dict:
+    """Which BOMs consume this item, and which BOM produces it.
+
+    `.list` cannot filter on a child array — materials.item_id is rejected — so the only route is to
+    read the BOMs and compare in code. That has to happen here rather than in the model: a BOM row
+    carries its materials and runs ~3,300 characters, so a hundred of them do not fit in one reply.
+    Seen live 2026-09-29, handed 11 of 100, the model reported the item was used nowhere; it is used
+    in three. Scanning here returns an answer instead of a sample.
+
+    Consumed and produced are reported separately on purpose. "Which BOMs use this item" was answered
+    with the BOM that makes it, which is the opposite relationship.
+    """
+    found = resolve_item(mcp, item)
+    if not found:
+        return {"found": False, "item": item,
+                "detail": "no item with that id, code, number or exact name"}
+    if not mcp.has_tool("BOM.list"):
+        return {"found": True, "item": _item_summary(found),
+                **seat_capability(mcp, "BOM.list"), "error": "BOM not readable by this seat"}
+
+    item_id = found["id"]
+    boms = mcp.list_all("BOM")
+    consumed_in, produced_by = [], []
+    for b in boms:
+        lines = [m for m in (b.get("materials") or []) if m.get("item_id") == item_id]
+        if lines:
+            consumed_in.append({"bom": b.get("number"), "bom_id": b.get("id"),
+                                "makes": b.get("_item_id_display"),
+                                "qty_per_build": sum(m.get("qty") or 0 for m in lines),
+                                "lines": len(lines),
+                                "is_critical": any(m.get("is_critical") for m in lines),
+                                "bom_is_active": bool(b.get("is_active")),
+                                "bom_is_default": bool(b.get("is_default"))})
+        if b.get("item_id") == item_id:
+            produced_by.append({"bom": b.get("number"), "bom_id": b.get("id"),
+                                "bom_is_active": bool(b.get("is_active")),
+                                "bom_is_default": bool(b.get("is_default"))})
+
+    consumed_in.sort(key=lambda r: (not r["bom_is_active"], r["bom"] or ""))
+    produced_by.sort(key=lambda r: (not r["bom_is_active"], r["bom"] or ""))
+    out = {"found": True, "item": _item_summary(found),
+           "consumed_in_boms": consumed_in, "produced_by_boms": produced_by,
+           "boms_scanned": len(boms), "boms_total": boms.total,
+           "complete": not boms.truncated}
+    if boms.truncated:
+        # A negative answer from a partial scan is the dangerous one, so say which it is.
+        out["instruction"] = (f"scanned {len(boms)} of {boms.total} BOMs — the read hit its ceiling. "
+                              "Report these as the BOMs found so far, and do not say the item is unused "
+                              "anywhere, because the BOMs not scanned were not checked.")
+    return out
+
+
+def _item_summary(item: dict) -> dict:
+    return {k: item.get(k) for k in ("id", "number", "code", "name", "item_group", "stock_uom") if k in item}
+
+
 # --------------------------------------------------------------------------- generic reads
 
 # The specific tools above encode judgement a raw row does not carry (blocking vs contributing,
