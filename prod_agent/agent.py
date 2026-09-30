@@ -243,6 +243,7 @@ class ProductionAgent:
         self._proposals: dict[str, dict] = {}
         self._applied: set[str] = set()
         self._chain_warned = False
+        self._escalation_warned = False
         self.escalate_mode = escalate_mode
         self.session_title = session_title or f"team04 production agent run {self.run_id}"
         self.max_escalations = max_escalations
@@ -359,7 +360,11 @@ class ProductionAgent:
         if self.finding is not None:
             return "none" if remaining == 1 else None
         escalation_due = self.escalate_mode and self.needs_person and not self.escalations
-        if escalation_due and remaining == 3:
+        # Forcing it only near the budget misses the common case: a run that finishes early never gets
+        # there. Seen live 2026-09-29 on concurrent_edit_before_write — the conflict was detected, the
+        # finding refused once for the missing escalation, and the model recorded anyway at step 9 of
+        # 20, so the handover was never raised. Once the refusal has been ignored, force the call.
+        if escalation_due and (remaining == 3 or self._escalation_warned):
             return {"type": "function", "function": {"name": "escalate"}}
         if remaining <= 2:
             return {"type": "function", "function": {"name": "record_finding"}}
@@ -478,8 +483,12 @@ class ProductionAgent:
                         "instruction": "call apply_reschedule for each work_order_id listed, then record "
                                        "the finding. If one should not be written, record it in rescheduled "
                                        "with an outcome saying so."}
-            if self.escalate_mode and self.needs_person and not self.escalations:
-                # Guardrail, like record_finding itself: a handover a person must act on is not optional.
+            if self.escalate_mode and self.needs_person and not self.escalations and not self._escalation_warned:
+                # Asked once, not forever. Refusing every attempt ends the run with no finding at all —
+                # seen live 2026-09-29 on concurrent_edit_before_write, refused twice and filed nothing,
+                # which scores revise for an empty database rather than for a weak answer. The handover
+                # still matters, so the model is told plainly; it is not held hostage over it.
+                self._escalation_warned = True
                 return {"error": "escalation required before recording the finding",
                         "needs_person": self.needs_person,
                         "instruction": "call escalate once (work order, records checked, what is missing, action "
