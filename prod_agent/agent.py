@@ -243,6 +243,8 @@ class ProductionAgent:
         self._proposals: dict[str, dict] = {}
         self._applied: dict[str, dict] = {}   # wo_id -> the write the platform confirmed
         self._conflicted: dict[str, dict] = {}  # wo_id -> a write the platform refused as stale
+        self._examined: set[str] = set()      # work orders this run actually looked up
+        self._subject_warned = False
         self._chain_warned = False
         self._escalation_warned = False
         self._rejected_finding_args = {}
@@ -426,6 +428,8 @@ class ProductionAgent:
 
     def _dispatch(self, name: str, args: dict):
         ref = args.get("work_order")
+        if name != "record_finding" and isinstance(ref, str) and ref.startswith("WO-"):
+            self._examined.add(ref)
         if name == "company_context":
             return domain.company_context(self.mcp)
         if name == "list_late_work_orders":
@@ -531,6 +535,24 @@ class ProductionAgent:
                     "error": "these fields cannot be null", "fields": nulled,
                     "instruction": "call record_finding again with a real value for each listed field"},
                     blame=nulled)
+            subject = args.get("work_order")
+            if (self._examined and isinstance(subject, str) and subject.startswith("WO-")
+                    and subject not in self._examined and not self._subject_warned):
+                # Seen live 2026-09-30 on downstream_potential_wo73: asked what WO-2026-00073 blocks,
+                # the run looked up that order and nothing else, then filed the finding against
+                # WO-2026-00116 — one of the downstream orders in the answer. The subject and the
+                # orders it blocks are different fields, and the blocked ones belong in
+                # potentially_blocked_work_orders. Only checked once the run has looked something up:
+                # a refusal that reads nothing names its order straight from the question, and has no
+                # examined set to match against. Warned once, never held: a second refusal can end the
+                # run with no finding, which scores worse than a finding about the wrong order.
+                self._subject_warned = True
+                return self._reject_finding(args, {
+                    "error": "the finding is about a work order this run never looked up",
+                    "work_order": subject, "examined": sorted(self._examined),
+                    "instruction": "record the order the question is about. Orders it blocks go in "
+                                   "potentially_blocked_work_orders, not work_order."},
+                    blame=("work_order",))
             cost = args.get("cost") or {}
             if cost and not (cost.get("expected") or cost.get("actual")):
                 return self._reject_finding(args, {
