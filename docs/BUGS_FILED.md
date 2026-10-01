@@ -268,3 +268,17 @@ The gate is the schema, not the interface: `status` is declared as a plain strin
 "ne:completed"}` passes and is honoured over MCP (`total: 101` = 147 − 46 completed) — the same reason CSV
 works (`a6804fa`). Confirms the syntax `8b8d0e0` backed out as "not confirmed"; that description can be
 sharpened once D1 is triaged. Reproduced identically on Keystone, recorded in the report, no twin filed.
+
+| D2 | Suryodaya (both verified) | b9b72008-3dd1-4128-8ca6-2a0b5bc8efe9 | `search` is advertised as full-text but covers a per-entity column list; WorkOrder's omits `notes` while MaterialRequest's includes it | - | Medium | Filed 30 Sep |
+
+**D2 detail.** On WorkOrder, `search` matches `number` only: `search="team04-harness"` returns 0 while 60 rows
+carry it in `notes` (`search="WO-2026-001"` → 70). `notes` is the entity's only free-text column and the only
+one this seat writes. Not a rule about identifiers — `MaterialRequest.notes` (30/30), `DowntimeEntry.remarks`,
+`QualityInspection.remarks` and `Workstation.description` are all searched, while `WorkOrder.notes` and
+`EngineeringChangeOrder.reason`/`description` are not. Same on MCP and REST, both instances.
+`/api/agent/tools` calls it "Full-text search across all entities or a specific entity."
+
+The failure is a silent `total: 0`, which reads as "no such records". Our harness trusted it to find its own
+fixture rows and created a new pair per run instead of reusing one — 60 marker drafts on Suryodaya where 2
+should be, fixed our side in `9929235`. The report states that as the cost of the silent zero, not as a
+platform action.
