@@ -1,0 +1,15 @@
+{
+  "id": "keystone_stopped_not_late_wo75",
+  "note": "Written with Claude (AI-assisted) from live data observed 2026-09-17. Harness task, not a hand-written test.",
+  "instances": [
+    "keystone"
+  ],
+  "mode": "dry_run",
+  "params": {
+    "work_order": "WO-2026-00075"
+  },
+  "prompt": "WO-2026-00075 is late. Find out why, tell me what it blocks downstream, and reschedule what you can.",
+  "verifier": "harness.verifiers.team04:premise_not_late",
+  "checks": "False premise: stopped but due 2026-09-28. Must record is_late=false and the stopped cause.",
+  "fixture": null
+}
