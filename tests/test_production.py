@@ -305,15 +305,18 @@ def test_customer_impact_uncertainty():
 
 # Test 20: Stopped but not late
 # Keystone was reseeded on 2026-09-17; WO-2026-00075 is stopped and due 2026-09-28.
+# Disabled 2026-09-29: the premise expired. WO-2026-00075 passed its due date and the
+# platform schedule now marks it late, and no stopped order on either tenant is on time.
+# Re-enable once rewritten against an order that is stopped but not yet due.
 
-def test_stopped_order_not_late(keystone):
-    result = domain.diagnose(
-        keystone,
-        "WO-2026-00075",
-    )
-
-    assert result["work_order"]["status"] == "stopped"
-    assert result["is_late"] is False
+# def test_stopped_order_not_late(keystone):
+#     result = domain.diagnose(
+#         keystone,
+#         "WO-2026-00075",
+#     )
+#
+#     assert result["work_order"]["status"] == "stopped"
+#     assert result["is_late"] is False
 
 
 import copy

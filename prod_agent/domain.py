@@ -13,6 +13,17 @@ from .mcp_client import McpClient, McpError
 OPEN_WO = {"draft", "not_started", "in_progress", "stopped"}
 OPEN_MR = {"draft", "submitted", "partially_ordered", "ordered"}
 DONE_SCO = {"completed", "cancelled"}
+def _csv(statuses: set[str]) -> str:
+    """`.list` reads a comma-separated value as OR, so a status set narrows at the server.
+
+    Confirmed over MCP on Suryodaya 2026-09-29: status=draft,not_started returned 78, exactly
+    draft (40) + not_started (38). Date operators are NOT available on this interface — the tool
+    schema declares planned_end_date as {"format": "date"} and rejects lt:/gte:/between:, though
+    REST accepts them on the same login. The Python status checks stay regardless.
+    """
+    return ",".join(sorted(statuses))
+
+
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
 # Signals whose ready date is unknown: no reschedule date can honestly be committed.
@@ -137,7 +148,7 @@ def _rest_status(mcp: McpClient, entity: str) -> int | None:
 
 def company_context(mcp: McpClient) -> dict:
     """Country and currency come from data, never from assumptions about which book we are in."""
-    companies = mcp.list_all("Company")
+    companies = mcp.call("Company.list", {"limit": 1}).get("data", [])
     wo = mcp.call("WorkOrder.list", {"limit": 1}).get("data", [])
     company_id = wo[0]["company_id"] if wo else (companies[0]["id"] if companies else None)
     c = mcp.call("Company.get", {"id": company_id}) if company_id else {}
@@ -182,7 +193,7 @@ def list_late_work_orders(mcp: McpClient) -> list[dict]:
     today = config.today()
     sched = {o["work_order_id"]: o for o in finite_schedule(mcp).get("orders", [])}
     late = []
-    for wo in mcp.list_all("WorkOrder"):
+    for wo in mcp.list_all("WorkOrder", status=_csv(OPEN_WO)):
         if wo.get("status") not in OPEN_WO:
             continue
         due = _date(wo.get("planned_end_date"))
@@ -347,7 +358,7 @@ def diagnose(mcp: McpClient, ref: str) -> dict:
             sig("workstation_downtime_recorded", station, since=_iso(since), **t)
 
     if eco_readable:
-        for e in mcp.list_all("EngineeringChangeOrder"):
+        for e in mcp.list_all("EngineeringChangeOrder", status=_csv(PENDING_ECO)):
             hits = [a for a in (e.get("affected_work_orders") or []) if a.get("work_order_id") == wid]
             if hits and e.get("status") in PENDING_ECO:
                 sig("engineering_change_pending", e.get("number"), status=e.get("status"), action=hits[0].get("action"),
@@ -374,7 +385,7 @@ def downstream_impact(mcp: McpClient, ref: str, max_depth: int = 3) -> dict:
     wo = resolve_work_order(mcp, ref)
     if not wo:
         return {"found": False, "ref": ref}
-    open_wos = [w for w in mcp.list_all("WorkOrder") if w.get("status") in OPEN_WO]
+    open_wos = [w for w in mcp.list_all("WorkOrder", status=_csv(OPEN_WO)) if w.get("status") in OPEN_WO]
     bom_inputs = {b["id"]: {m.get("item_id") for m in (b.get("materials") or [])} for b in mcp.list_all("BOM")}
 
     # item consumed -> the open orders whose BOM consumes it, so the walk below is a lookup per node
@@ -605,7 +616,7 @@ def capacity_outlook(mcp: McpClient, horizon_days: int = 21) -> dict:
     res = mcp.call("endpoint.manufacturing.capacity_board", {"horizon_days": int(horizon_days)})
     board = res.get("result", res) or {}
     counts = board.get("counts") or {}
-    cards = [c for c in mcp.list_all("JobCard") if c.get("status") in OPEN_JOB_CARD]
+    cards = [c for c in mcp.list_all("JobCard", status=_csv(OPEN_JOB_CARD)) if c.get("status") in OPEN_JOB_CARD]
     stations = {w["id"]: w for w in mcp.list_all("Workstation")}
 
     booked = counts.get("booked_minutes")
@@ -655,7 +666,8 @@ def order_feasible_by(mcp: McpClient, ref: str, due: str) -> dict:
         return {"found": True, "work_order": wo.get("number"), "verdict": "unknown",
                 "reason": f"could not read {due!r} as a date"}
     today = config.today()
-    cards = [c for c in mcp.list_all("JobCard", work_order_id=wo["id"]) if c.get("status") in OPEN_JOB_CARD]
+    cards = [c for c in mcp.list_all("JobCard", work_order_id=wo["id"], status=_csv(OPEN_JOB_CARD))
+             if c.get("status") in OPEN_JOB_CARD]
     remaining = _work_content_minutes(cards)
     diag = diagnose(mcp, wo.get("number") or ref)
     blocking = list(diag.get("blocking_causes") or [])
@@ -773,17 +785,238 @@ def record_finding(mcp: McpClient, run_id: str, finding: dict) -> dict:
     })
     return {"agent_memory_id": row.get("id"), "run_id": run_id}
 
-# --- Stopped/finished orders are never late ---------------------------------
-NOT_LATE_STATUSES = {"stopped", "cancelled", "canceled", "completed", "closed"}
+# --------------------------------------------------------------------------- where used
 
-_diagnose_original = diagnose
+def resolve_item(mcp: McpClient, ref: str) -> dict | None:
+    """An item by id, code (RM-BOLT-M8), number (ITEM-2026-00011) or exact name.
+
+    Matched locally over the item list rather than through `search`, because an exact comparison is
+    what the caller means and `search` semantics are the platform's to change. Names are unique on
+    both books (checked 2026-09-29), so a name is as safe a key as a code here.
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        return None
+    if UUID_RE.match(ref):
+        try:
+            return mcp.call("Item.get", {"id": ref})
+        except McpError as e:
+            if e.kind == "not_found" or "not found" in e.message.lower():
+                return None
+            raise
+    wanted = ref.casefold()
+    for item in mcp.list_all("Item"):
+        if any((item.get(f) or "").strip().casefold() == wanted for f in ("code", "number", "name")):
+            return item
+    return None
 
 
-def diagnose(mcp, ref, *args, **kwargs):
-    result = _diagnose_original(mcp, ref, *args, **kwargs)
-    if isinstance(result, dict):
-        wo = result.get("work_order") or {}
-        status = str(wo.get("status") or "").strip().lower()
-        if status in NOT_LATE_STATUSES:
-            result["is_late"] = False
-    return result
+def where_is_item_used(mcp: McpClient, item: str) -> dict:
+    """Which BOMs consume this item, and which BOM produces it.
+
+    `.list` cannot filter on a child array — materials.item_id is rejected — so the only route is to
+    read the BOMs and compare in code. That has to happen here rather than in the model: a BOM row
+    carries its materials and runs ~3,300 characters, so a hundred of them do not fit in one reply.
+    Seen live 2026-09-29, handed 11 of 100, the model reported the item was used nowhere; it is used
+    in three. Scanning here returns an answer instead of a sample.
+
+    Consumed and produced are reported separately on purpose. "Which BOMs use this item" was answered
+    with the BOM that makes it, which is the opposite relationship.
+    """
+    found = resolve_item(mcp, item)
+    if not found:
+        return {"found": False, "item": item,
+                "detail": "no item with that id, code, number or exact name"}
+    if not mcp.has_tool("BOM.list"):
+        return {"found": True, "item": _item_summary(found),
+                **seat_capability(mcp, "BOM.list"), "error": "BOM not readable by this seat"}
+
+    item_id = found["id"]
+    boms = mcp.list_all("BOM")
+    consumed_in, produced_by = [], []
+    for b in boms:
+        lines = [m for m in (b.get("materials") or []) if m.get("item_id") == item_id]
+        if lines:
+            consumed_in.append({"bom": b.get("number"), "bom_id": b.get("id"),
+                                "makes": b.get("_item_id_display"),
+                                "qty_per_build": sum(m.get("qty") or 0 for m in lines),
+                                "lines": len(lines),
+                                "is_critical": any(m.get("is_critical") for m in lines),
+                                "bom_is_active": bool(b.get("is_active")),
+                                "bom_is_default": bool(b.get("is_default"))})
+        if b.get("item_id") == item_id:
+            produced_by.append({"bom": b.get("number"), "bom_id": b.get("id"),
+                                "bom_is_active": bool(b.get("is_active")),
+                                "bom_is_default": bool(b.get("is_default"))})
+
+    consumed_in.sort(key=lambda r: (not r["bom_is_active"], r["bom"] or ""))
+    produced_by.sort(key=lambda r: (not r["bom_is_active"], r["bom"] or ""))
+    out = {"found": True, "item": _item_summary(found),
+           "consumed_in_boms": consumed_in, "produced_by_boms": produced_by,
+           "boms_scanned": len(boms), "boms_total": boms.total,
+           "complete": not boms.truncated}
+    if boms.truncated:
+        # A negative answer from a partial scan is the dangerous one, so say which it is.
+        out["instruction"] = (f"scanned {len(boms)} of {boms.total} BOMs — the read hit its ceiling. "
+                              "Report these as the BOMs found so far, and do not say the item is unused "
+                              "anywhere, because the BOMs not scanned were not checked.")
+    return out
+
+
+def _item_summary(item: dict) -> dict:
+    return {k: item.get(k) for k in ("id", "number", "code", "name", "item_group", "stock_uom") if k in item}
+
+
+# --------------------------------------------------------------------------- generic reads
+
+# The specific tools above encode judgement a raw row does not carry (blocking vs contributing,
+# "potential" never "confirmed", a verdict that may not say yes). query_records exists only for
+# questions none of them answers; the prompt keeps it a fallback. Everything here is read-only.
+QUERY_MAX_ROWS = 200            # never hand the model more than this in one call
+QUERY_NARROW_ABOVE = 2000       # above this, return the count and refuse to page
+
+# Rows are the wrong unit to cap on: a BOM row carrying its materials and operations is ~3,300
+# characters, a Workstation row ~300. Seen live 2026-09-29: 100 BOMs came back as 100 of 100 with
+# truncated false, serialised to 327k characters, and the 60k tool-content limit then cut it to about
+# 16 rows — the model was told it held every BOM while holding a sixth of them. Budget by size, below
+# the transport limit, so the envelope's own count is the number that actually arrives.
+QUERY_MAX_CHARS = 40000
+
+# `.list` accepts these alongside real field names; they shape the page rather than filter it.
+_QUERY_CONTROLS = {"limit", "offset", "sort_by", "sort_order", "search"}
+
+
+QUERY_GROUP_MAX_VALUES = 40      # distinct values reported; the tail is summed into "other"
+QUERY_GROUP_LABEL_CHARS = 80     # an error message is a legitimate group key and can be long
+
+
+def query_group(mcp: McpClient, entity: str, field: str, filters: dict | None = None) -> dict:
+    """Count matching records by one field, over the whole matching set rather than a page.
+
+    A page cannot answer "what were they doing". Seen live 2026-09-29: handed 50 of 1209 failed
+    AgentJob rows, the model reported one error code for all 1209 — the true split was 773/328/107/1.
+    Warning it not to generalise leaves it no way to be right; counting does. MCP exposes no aggregate
+    tool (REST has one), so the rows are walked here and only the counts are returned, which keeps the
+    payload small no matter how many rows were read.
+    """
+    filters = {k: v for k, v in (filters or {}).items() if v is not None and k not in _QUERY_CONTROLS}
+    if not mcp.has_tool(f"{entity}.list"):
+        return {"entity": entity, "error": "not readable by this seat", **seat_capability(mcp, f"{entity}.list")}
+    try:
+        rows = mcp.list_all(entity, **filters)
+    except McpError as e:
+        return {"entity": entity, "error": e.message, "filters_sent": sorted(filters)}
+
+    counts: dict[str, int] = {}
+    missing = 0
+    for r in rows:
+        value = r.get(field)
+        if value is None or value == "":
+            missing += 1
+            continue
+        label = str(value)
+        if len(label) > QUERY_GROUP_LABEL_CHARS:
+            label = label[:QUERY_GROUP_LABEL_CHARS] + "…"
+        counts[label] = counts.get(label, 0) + 1
+
+    ranked = sorted(counts.items(), key=lambda kv: -kv[1])
+    groups = dict(ranked[:QUERY_GROUP_MAX_VALUES])
+    tail = sum(n for _, n in ranked[QUERY_GROUP_MAX_VALUES:])
+    out = {"entity": entity, "filters": filters, "group_by": field,
+           "scanned": len(rows), "total": rows.total, "groups": groups,
+           "distinct_values": len(ranked), "complete": not rows.truncated}
+    if tail:
+        out["other_values_combined"] = tail
+    if missing:
+        out["rows_with_no_value"] = missing
+    if rows.truncated:
+        out["instruction"] = (f"counted {len(rows)} of {rows.total} matching records — the read stopped at its "
+                              "ceiling, so these counts are a floor, not the full split. Say so, and narrow "
+                              "the filters if an exact split is needed.")
+    return out
+
+
+def query_records(mcp: McpClient, entity: str, filters: dict | None = None,
+                  limit: int = 50, sort_by: str | None = None, newest_first: bool = True) -> dict:
+    """Read rows of one entity this seat may see, always bounded and always saying what was not returned.
+
+    Counts before it fetches: a counting question costs one call and no rows, and a million matches
+    costs the same. `total` is returned beside every page so the model cannot mistake a page for the
+    whole table — the failure this exists to prevent.
+    """
+    filters = {k: v for k, v in (filters or {}).items() if v is not None and k not in _QUERY_CONTROLS}
+    # limit=0 is the platform's own count-only idiom, so keep it meaning that rather than "unset".
+    limit = 0 if limit == 0 else max(1, min(int(limit or 50), QUERY_MAX_ROWS))
+
+    if not mcp.has_tool(f"{entity}.list"):
+        # Reuse the probe that already distinguishes a wrong name from a real seat limit.
+        return {"entity": entity, "error": "not readable by this seat", **seat_capability(mcp, f"{entity}.list")}
+
+    page = {"limit": 1, **filters}
+    if sort_by:
+        page.update({"sort_by": sort_by, "sort_order": "desc" if newest_first else "asc"})
+    try:
+        probe = mcp.call(f"{entity}.list", page)
+    except McpError as e:
+        # The platform names the offending filter ("Unknown filter 'x' for Y"), which is worth passing through:
+        # closed schemas mean a wrong field name fails loudly rather than returning every row.
+        return {"entity": entity, "error": e.message, "filters_sent": sorted(filters),
+                "instruction": "check the field name against a row you have already seen, then call again"}
+
+    total = probe.get("total") if isinstance(probe, dict) else None
+    if total is None:
+        total = len(probe.get("data", []) if isinstance(probe, dict) else probe or [])
+
+    result = {"entity": entity, "filters": filters, "total": total}
+    if total == 0:
+        return {**result, "returned": 0, "rows": [], "truncated": False}
+    if total > QUERY_NARROW_ABOVE:
+        # Paging this would cost total/200 sequential calls and overflow the context either way.
+        return {**result, "returned": 0, "rows": [], "truncated": True, "too_many": True,
+                "instruction": f"{total} records match. Add filters (status, a date with lt:/gte:/between:, an id) "
+                               "and call again, or tell the user the set is too large to read and what would narrow it."}
+
+    if limit == 0:
+        return {**result, "returned": 0, "rows": [], "truncated": total > 0, "count_only": True}
+
+    rows = mcp.call(f"{entity}.list", {**page, "limit": min(limit, total)}).get("data", [])
+
+    # Trim to what will survive serialisation, so returned/truncated describe what the model receives
+    # rather than what was fetched. Fencing inflates this further upstream, hence the margin.
+    kept, budget = [], QUERY_MAX_CHARS
+    for row in rows:
+        cost = len(json.dumps(row, default=str)) + 2
+        if kept and cost > budget:
+            break
+        kept.append(row)
+        budget -= cost
+    dropped_for_size = len(rows) - len(kept)
+    rows = kept
+    truncated = total > len(rows)
+    out = {**result, "returned": len(rows), "rows": rows, "truncated": truncated}
+    if dropped_for_size:
+        out["dropped_for_size"] = dropped_for_size
+        out["size_limited"] = True
+    if truncated:
+        # Naming the move matters: seen live 2026-09-29, the model was told it held 50 of 100 BOMs and
+        # moved on rather than asking for the rest, so a question answerable from the full set was
+        # answered from half of it. Rows carry their child arrays, so "fetch it all and scan" is often
+        # the whole answer — say so when the set actually fits under the cap.
+        fits = total <= QUERY_MAX_ROWS and not dropped_for_size
+        if dropped_for_size:
+            nextstep = (f"These rows are large, so only {len(rows)} of {total} fit in one reply. Asking for a "
+                        "higher limit will NOT return more. Narrow the filters so fewer records match, or use "
+                        "query_group if you only need counts across the whole set.")
+        elif fits:
+            nextstep = f"All {total} fit in one call: repeat this query with limit={total} to get them all."
+        else:
+            nextstep = (f"{total} will not fit in one call (cap {QUERY_MAX_ROWS}): narrow the filters, "
+                        "or use query_group if you only need counts.")
+        out["next_step"] = nextstep
+        out["instruction"] = (f"these are {len(rows)} of {total} matching records, ordered by "
+                              f"{sort_by or 'server default'}. Say so rather than presenting them as all of them. "
+                              "Never total or average over them, and never say what these records have in common "
+                              "as though it held for all {total}: if you are about to describe the set — a shared "
+                              "error, status, reason, owner or kind — call query_group on that field instead, which "
+                              "counts every matching record. " + nextstep).format(total=total)
+    return out

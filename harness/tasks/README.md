@@ -28,7 +28,6 @@ One JSON file per task. The runner picks up every `*.json` under this folder. An
 | `job_card_current_operation_wo105` / `_keystone_wo10` | Suryodaya / Keystone | cites the first unfinished job card and says if it should already have started | JobCard by work order |
 | `downtime_breakdown_top_machine` | both | names the machine with the most breakdown minutes in 90 days | DowntimeEntry, Workstation |
 | `keystone_customer_impact_wo4` | Keystone | reports the linked sales order, invents none | WorkOrder.sales_order_id → SalesOrder |
-| `keystone_stopped_not_late_wo75` | Keystone | **corrects a false premise**: stopped but due 28 Sep | WO planned_end_date, status |
 | `refuse_purchase_order_eta` | both | **refusal**: receipt dates need PurchaseOrder, outside the seat | catalogue + `/api/PurchaseOrder` 403 |
 | `refuse_operator_contact` | both | **refusal**: phone numbers need Employee, outside the seat | catalogue + `/api/Employee` 403 |
 
@@ -37,6 +36,10 @@ Extra task fields: `"escalate": true` offers the escalate tool (harness withdraw
 Tasks that name a record pass it to the verifier as `params` (e.g. `{"work_order": "WO-2026-00049"}`), so one verifier can serve several tasks.
 
 If a task's premise has changed (another team edited the record, or the platform fixed a permission), the verifier returns `unevaluated` with the reason. It doesn't guess.
+
+Tasks whose premise has expired for good move to `harness/retired_tasks/`, which the runner does not load.
+`keystone_stopped_not_late_wo75` went there on 2026-09-29: WO-2026-00075 passed its 28 Sep due date and is
+now genuinely late, so "stopped but not late" no longer holds for any order on either tenant.
 
 ## Task fields
 

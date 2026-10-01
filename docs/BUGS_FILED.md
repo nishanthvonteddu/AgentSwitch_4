@@ -251,3 +251,34 @@ Swept and clean, recorded so we do not re-check: `planned_end < planned_start` (
 `total_items` / `limit` / `offset` / `complete` at limit 1, 50 and 500). The new endpoints report their own
 limits honestly — `capacity_board` publishes `malformed_workstation_ids`, `finite_schedule` publishes
 `uncosted_item_change_pairs` and a `generic_late_cause_rate` — which is the discipline S29 and N233 asked for.
+
+## 29 September — the MCP filter gate
+
+| D1 | Suryodaya (both verified) | 7525f98c-89cd-445c-9908-8cc21e32a068 | Date and numeric range filters (`lt:` `gte:` …) are rejected by the MCP tool schema but work over REST, so no agent can filter by date | - | High | Filed 29 Sep |
+
+**D1 detail.** `WorkOrder.list` over MCP with `planned_end_date: "lt:2026-09-29"` returns `-32602`
+(`/planned_end_date must be a valid date.`); the same filter over REST returns 200 and `total: 124` of 147,
+correctly applied (`lt:` 124 + `gte:` 23 = 147, no nulls). Cause, from `tools/list`:
+`{"type": "string", "format": "date"}` — the operator prefix fails JSON-Schema validation before dispatch.
+Numeric args fail the same way (`{"qty": "gt:100"}` → `/qty must be number.`, REST returns 46). Every
+date-typed argument we tried is refused, across `WorkOrder`, `JobCard`, `DowntimeEntry` and `MaterialRequest`;
+`created_at` is not an MCP argument at all, though REST filters on it.
+
+The gate is the schema, not the interface: `status` is declared as a plain string, so `{"status":
+"ne:completed"}` passes and is honoured over MCP (`total: 101` = 147 − 46 completed) — the same reason CSV
+works (`a6804fa`). Confirms the syntax `8b8d0e0` backed out as "not confirmed"; that description can be
+sharpened once D1 is triaged. Reproduced identically on Keystone, recorded in the report, no twin filed.
+
+| D2 | Suryodaya (both verified) | b9b72008-3dd1-4128-8ca6-2a0b5bc8efe9 | `search` is advertised as full-text but covers a per-entity column list; WorkOrder's omits `notes` while MaterialRequest's includes it | - | Medium | Filed 30 Sep |
+
+**D2 detail.** On WorkOrder, `search` matches `number` only: `search="team04-harness"` returns 0 while 60 rows
+carry it in `notes` (`search="WO-2026-001"` → 70). `notes` is the entity's only free-text column and the only
+one this seat writes. Not a rule about identifiers — `MaterialRequest.notes` (30/30), `DowntimeEntry.remarks`,
+`QualityInspection.remarks` and `Workstation.description` are all searched, while `WorkOrder.notes` and
+`EngineeringChangeOrder.reason`/`description` are not. Same on MCP and REST, both instances.
+`/api/agent/tools` calls it "Full-text search across all entities or a specific entity."
+
+The failure is a silent `total: 0`, which reads as "no such records". Our harness trusted it to find its own
+fixture rows and created a new pair per run instead of reusing one — 60 marker drafts on Suryodaya where 2
+should be, fixed our side in `9929235`. The report states that as the cost of the silent zero, not as a
+platform action.

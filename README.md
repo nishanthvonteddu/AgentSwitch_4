@@ -142,6 +142,7 @@ Output goes to `runs/<timestamp>/<instance>/<task>/`: `task.json`, `fixture.json
 - **SalesOrder:** read-only on both instances (Keystone gained `sales_viewer` on 17 Sep). Read was revoked by the 20 Sep release and restored on 22 Sep — `.list`/`.get` verified on both, `.update` still absent.
 - **Outside the seat:** PurchaseOrder, StockEntry, Employee and payroll (REST 403, not in the catalogue).
 - **Links and locks:** WorkOrder has no parent/child link, so downstream impact comes from a reverse walk of BOM materials. Submitted work orders are date-locked, and cancel is admin-only (no longer listed for this seat).
+- **No date or numeric range filter over MCP (29 Sep):** `lt:`/`gte:` are refused with `-32602` on date and number arguments, though they work over REST — the MCP schema types the field. Plain-string fields like `status` do accept them. The agent filters client-side until this is fixed; filed as D1 in [docs/BUGS_FILED.md](docs/BUGS_FILED.md).
 
 ## Rows this team created on Suryodaya
 

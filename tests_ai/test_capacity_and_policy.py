@@ -33,10 +33,13 @@ class FakeMcp:
         value = self._calls[name]
         return value(arguments) if callable(value) else value
 
-    def list_all(self, entity, page=200, **filters):
+    def list_all(self, entity, page=200, max_rows=None, **filters):
         rows = self._lists.get(entity, [])
         for key, wanted in filters.items():
-            rows = [r for r in rows if r.get(key) == wanted]
+            # `.list` reads a comma-separated value as OR (confirmed over MCP 2026-09-29), so the
+            # fake must too, or a server-side status filter looks like a bug that is not there.
+            allowed = set(str(wanted).split(",")) if isinstance(wanted, str) else {wanted}
+            rows = [r for r in rows if r.get(key) in allowed]
         return rows
 
 
