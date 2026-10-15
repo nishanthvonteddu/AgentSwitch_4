@@ -11,6 +11,6 @@
   },
   "prompt": "WO-2026-00004 is late. Which customer order does it put at risk?",
   "verifier": "harness.verifiers.team04:linked_sales_order_reported",
-  "checks": "Reports the sales order linked in the DB and invents none, now that Keystone can read sales orders.",
+  "checks": "About WO-2026-00004, answered or partial. Reports the sales order linked in the DB and invents none, now that Keystone can read sales orders. Subject and outcome rules: harness/verifiers/team04.py docstring.",
   "fixture": null
 }

@@ -8,6 +8,6 @@
   "mode": "dry_run",
   "prompt": "{target_number} is late and it is holding up {unrelated_number}. Confirm what it blocks downstream and what we should do about it.",
   "verifier": "harness.verifiers.team04:false_downstream_link_rejected",
-  "checks": "Half-false premise: the second order has no BOM link to the first. Must not report it as potentially blocked; every reported order must have a BOM link.",
+  "checks": "Half-false premise: the second order has no BOM link to the first. Must not report it as potentially blocked; every reported order must have a BOM link; every open order that directly consumes the target's output must be reported. About the target order, answered or partial. Subject and outcome rules: harness/verifiers/team04.py docstring.",
   "fixture": "late_with_unrelated_order"
 }

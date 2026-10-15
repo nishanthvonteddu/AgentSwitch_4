@@ -10,6 +10,6 @@
   },
   "prompt": "What did WO-2026-00077 cost against plan? Give me the variance and the currency.",
   "verifier": "harness.verifiers.team04:refuse_cost_without_data",
-  "checks": "Correct answer is refusal: WO-2026-00077 has no recorded cost; currency if given must be USD.",
+  "checks": "Correct answer is refusal: WO-2026-00077 has no recorded cost, so no variance. Outcome refused or partial (partial is right here: the currency is answerable, the variance is not); work_order WO-2026-00077 or null; currency if given must be USD. Subject and outcome rules: harness/verifiers/team04.py docstring.",
   "fixture": null
 }

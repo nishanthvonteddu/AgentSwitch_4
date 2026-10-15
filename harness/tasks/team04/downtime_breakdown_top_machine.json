@@ -12,6 +12,6 @@
   },
   "prompt": "Over the last 90 days, which machine lost the most time to breakdowns, and how much?",
   "verifier": "harness.verifiers.team04:downtime_top_workstation",
-  "checks": "Names the workstation with the most breakdown minutes in DowntimeEntry over 90 days (ties accepted).",
+  "checks": "Answered or partial. Names the workstation with the most breakdown minutes in DowntimeEntry over 90 days (ties accepted) in evidence_records, by its number or full name as a whole token. Unevaluated when downtime recorded without a workstation is at least the top machine's total, since which machine lost most cannot then be told. Subject and outcome rules: harness/verifiers/team04.py docstring.",
   "fixture": null
 }

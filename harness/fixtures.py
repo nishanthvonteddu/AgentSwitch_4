@@ -4,17 +4,22 @@ Work orders cannot be deleted or cancelled by manufacturing_user, so fixtures ar
 instance, found again by their marker, and reset (drafts stay editable) before every run.
 """
 import datetime as dt
+import itertools
 
-from prod_agent import config
+from prod_agent import config, domain
 from prod_agent.mcp_client import McpClient
 
 MARK = f"{config.HARNESS_MARKER} fixture:late_draft_chain"
 
 
-def _find_bom_chain(mcp: McpClient):
-    """Active upstream BOM whose item is a material of an active downstream BOM, with no stock shortage
-    for qty 1 right now, so the upstream order has a committable date. Stock is shared state and
-    can change between runs; the choice is recorded in fixture.json."""
+# Each chain tried costs two writes to our own fixture drafts and one diagnosis, so the search is bounded.
+MAX_CHAIN_TRIES = 5
+
+
+def _bom_chains(mcp: McpClient):
+    """Active upstream BOMs whose item is a material of an active downstream BOM, with no stock shortage
+    for qty 1 right now. Stock is shared state and can change between runs; the choice is recorded in
+    fixture.json."""
     boms = [b for b in mcp.list_all("BOM") if b.get("item_id") and b.get("is_active")]
     by_item = {b["item_id"]: b for b in boms}
     for down in boms:
@@ -24,12 +29,25 @@ def _find_bom_chain(mcp: McpClient):
                 continue
             stock = mcp.call("endpoint.manufacturing.check_stock_availability", {"bom_id": up["id"], "qty": 1})
             if stock.get("result", stock).get("overall_status") == "ok":
-                return up, down
-    return None, None
+                yield up, down
+
+
+def _undated_blockers(mcp: McpClient, work_order_id: str) -> list[str]:
+    """Blocking signal codes on the order, by the rule propose_reschedule applies to decide a date is committable.
+
+    The write tasks assume the upstream order HAS a committable date, and the product decides that with
+    domain.diagnose: any blocking signal (domain.UNDATED_BLOCKERS) makes it uncommittable, and nothing may be
+    written. A stock screen alone missed the rest (an active breakdown, an unavailable workstation, a pending
+    engineering change, a rejected inspection, a subcontract), and a correct "nothing written" then scored
+    revise. This is setup, not grading: it uses the product's own rule so the scenario is one the product can
+    act on, and the verifier still checks the outcome against REST reads of its own."""
+    diag = domain.diagnose(mcp, work_order_id)
+    return sorted({s["code"] for s in diag.get("signals") or [] if s.get("blocking")})
 
 
 def late_draft_chain(mcp: McpClient) -> dict:
-    """Upstream draft WO, already past due, feeding a draft downstream WO that starts too early."""
+    """Upstream draft WO, already past due, feeding a draft downstream WO that starts too early, with no
+    undated blocker on the upstream, so a date can be committed for both."""
     today = config.today()
     dates = {
         "upstream": (today - dt.timedelta(days=10), today - dt.timedelta(days=3)),
@@ -46,30 +64,40 @@ def late_draft_chain(mcp: McpClient) -> dict:
         if MARK in notes and wo.get("status") == "draft":
             existing.setdefault("upstream" if "role:upstream" in notes else "downstream", wo)
 
-    up_bom, down_bom = _find_bom_chain(mcp)
-    if not up_bom:
-        raise RuntimeError("no active BOM chain without a stock shortage on this instance")
-    boms = {"upstream": up_bom, "downstream": down_bom}
-    for role, bom in boms.items():
-        if role not in existing:
-            existing[role] = mcp.call("WorkOrder.create", {
-                "item_id": bom["item_id"], "bom_id": bom["id"], "qty": 1, "priority": "low",
-                "notes": f"{MARK} role:{role}. Owned by team04 test harness; please ignore.",
-            })
+    tried = []
+    for up_bom, down_bom in itertools.islice(_bom_chains(mcp), MAX_CHAIN_TRIES):
+        boms = {"upstream": up_bom, "downstream": down_bom}
+        for role, bom in boms.items():
+            if role not in existing:
+                existing[role] = mcp.call("WorkOrder.create", {
+                    "item_id": bom["item_id"], "bom_id": bom["id"], "qty": 1, "priority": "low",
+                    "notes": f"{MARK} role:{role}. Owned by team04 test harness; please ignore.",
+                })
 
-    out = {}
-    for role, wo in existing.items():
-        start, end = dates[role]
-        # Drafts stay editable, so each run repoints the same rows at a usable chain and resets dates.
-        mcp.call("WorkOrder.update", {"id": wo["id"], "item_id": boms[role]["item_id"], "bom_id": boms[role]["id"],
-                                       "qty": 1, "planned_start_date": start.isoformat(),
-                                       "planned_end_date": end.isoformat()})
-        fresh = mcp.call("WorkOrder.get", {"id": wo["id"]})
-        out[role] = {"id": fresh["id"], "number": fresh["number"], "status": fresh["status"],
-                     "bom": boms[role].get("number"), "qty": fresh.get("qty"),
-                     "planned_start_date": fresh.get("planned_start_date"), "planned_end_date": fresh.get("planned_end_date")}
-    out["write_ids"] = [out["upstream"]["id"], out["downstream"]["id"]]
-    return out
+        out = {}
+        for role, wo in existing.items():
+            start, end = dates[role]
+            # Drafts stay editable, so each run repoints the same rows at a usable chain and resets dates.
+            mcp.call("WorkOrder.update", {"id": wo["id"], "item_id": boms[role]["item_id"],
+                                           "bom_id": boms[role]["id"], "qty": 1,
+                                           "planned_start_date": start.isoformat(),
+                                           "planned_end_date": end.isoformat()})
+            fresh = mcp.call("WorkOrder.get", {"id": wo["id"]})
+            out[role] = {"id": fresh["id"], "number": fresh["number"], "status": fresh["status"],
+                         "bom": boms[role].get("number"), "qty": fresh.get("qty"),
+                         "planned_start_date": fresh.get("planned_start_date"),
+                         "planned_end_date": fresh.get("planned_end_date")}
+        blockers = _undated_blockers(mcp, out["upstream"]["id"])
+        if not blockers:
+            # Recorded so the verifier can tell a premise that held at setup from one that broke during the run.
+            out["upstream"]["undated_blockers"] = blockers
+            out["write_ids"] = [out["upstream"]["id"], out["downstream"]["id"]]
+            return out
+        tried.append(f"{up_bom.get('number')}: {', '.join(blockers)}")
+    if not tried:
+        raise RuntimeError("no active BOM chain without a stock shortage on this instance")
+    raise RuntimeError("every BOM chain tried leaves the upstream order with an undated blocker, so no date "
+                       "could be committed and the write tasks have no honest premise: " + "; ".join(tried))
 
 
 CONCURRENT_EDIT_NOTE = " | concurrent edit simulated by team04 harness"

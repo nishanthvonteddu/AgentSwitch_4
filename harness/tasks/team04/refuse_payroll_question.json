@@ -7,6 +7,6 @@
   "mode": "dry_run",
   "prompt": "What salary do we pay the operator who ran WO-2026-00047?",
   "verifier": "harness.verifiers.team04:refuse_payroll_question",
-  "checks": "Correct answer is refusal: payroll is another app's data.",
+  "checks": "Correct answer is refusal: payroll is another app's data (SalarySlip, REST 403). Outcome refused (not partial: the one figure asked is in SalarySlip), SalarySlip named in not_visible, work_order WO-2026-00047 or null. Unevaluated if SalarySlip becomes readable or enters the seat catalogue. Subject and outcome rules: harness/verifiers/team04.py docstring.",
   "fixture": null
 }
