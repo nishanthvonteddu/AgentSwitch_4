@@ -12,10 +12,14 @@ file AgentSwitch's harness runner reads (agentswitch-harness.toml, harness/resul
 
 Under that runner (AGENTSWITCH_TOKEN set) a run serves the one instance it was given, with the runner's
 seat token and model, inside a time budget, after a preflight that checks both doors and the model.
+
+A local run holds runs/.console-run.lock, the same lock the console (viewer/jobs.py) takes, so two runs never
+share a seat at once: verifiers attribute writes by seat and time window, and would grade each other's.
 """
 import argparse
 import datetime as dt
 import email.utils
+import http.client
 import importlib
 import json
 import os
@@ -27,6 +31,11 @@ import urllib.error
 import urllib.request
 from concurrent import futures
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows has no flock: a local run there is unguarded, as the console is (viewer/jobs.py)
+    fcntl = None
 
 from prod_agent import config, domain
 from prod_agent.agent import NO_CREDIT, ProductionAgent, default_llm, probe_reasoning_off, probe_tool_choice
@@ -55,6 +64,57 @@ WATCHDOG_GRACE_SECONDS = 90   # past the budget, end the process with results.js
 TASK_TOKENS_DEFAULT = 30_000  # a task's own token limit unless its json sets max_tokens
 
 PREFLIGHT_TITLE = "The harness reaches the instance (MCP and REST) and the model with the runner's credentials"
+
+# One run at a time per checkout. Verifiers judge "this seat wrote nothing" by every write the team account made
+# since the task started (verify.py my_writes_since_start), so a second run on the same tenant fails the first
+# one's read-only tasks; it happened when a console run and a terminal run overlapped. The console takes this
+# same file before it starts a child, so the path must match viewer/jobs.py's default.
+RUN_LOCK_PATH = config.ROOT / "runs" / ".console-run.lock"
+# flock belongs to an open file description: a console-launched runner already holds the lock through the fd it
+# inherited, and a fresh open() of the file would be refused by its own parent's lock. The console names that fd.
+RUN_LOCK_FD_ENV = "HARNESS_RUN_LOCK_FD"
+
+
+class RunLocked(Exception):
+    pass
+
+
+def _inherited_lock_fd(path: Path) -> int | None:
+    """The fd the console handed down, if it really is open on the lock file; a stale or stray value is ignored."""
+    raw = os.environ.get(RUN_LOCK_FD_ENV, "")
+    if not raw.isdigit():
+        return None
+    try:
+        held, want = os.fstat(int(raw)), os.stat(path)
+    except (OSError, OverflowError):
+        return None
+    return int(raw) if (held.st_dev, held.st_ino) == (want.st_dev, want.st_ino) else None
+
+
+def hold_run_lock(path: Path | None = None) -> int | None:
+    """Take the run lock (exclusive, never waiting) and return its fd, to keep open for the whole run.
+
+    Re-locking an inherited fd succeeds because its open file description already holds the lock; if the console
+    has since let go, it simply takes it again. None where there is no flock (Windows)."""
+    if fcntl is None:
+        return None
+    path = path or RUN_LOCK_PATH
+    fd = _inherited_lock_fd(path)
+    if fd is None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        os.close(fd)
+        raise RunLocked(f"another harness run holds {path} ({e.strerror}); wait for it to finish, a second run "
+                        "on the same seat would make the verifiers grade each other's writes") from None
+    return fd
+
+
+def release_run_lock(fd: int | None) -> None:
+    if fd is not None:
+        os.close(fd)  # the last close of the open file description drops the flock
 
 
 def _new_run_root(base: Path) -> Path:
@@ -117,7 +177,9 @@ def capture_context(rest: RestClient, task: dict) -> dict:
     """Who we are, when the run started (server clock, UTC), and rows as they were before the run."""
     try:
         started = _server_now_utc(rest.session.base)
-    except (urllib.error.URLError, KeyError, TypeError, ValueError):
+    # A dropped or timed-out HEAD (RemoteDisconnected, ConnectionResetError, TimeoutError: all OSError, as is
+    # URLError) or a garbled reply (HTTPException) costs only clock precision, never the task.
+    except (OSError, http.client.HTTPException, KeyError, TypeError, ValueError):
         started = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
     started -= dt.timedelta(seconds=2)
     return {
@@ -144,6 +206,36 @@ def persist_then_verify(run_dir: Path, result: dict, verify, *, catch: bool = Tr
         return Verdict.UNEVALUATED, "verifier raised:\n" + traceback.format_exc()
 
 
+NO_TOKENS = {"prompt": 0, "completion": 0, "total": 0}
+
+
+def _prompt_for(task: dict, fixture: dict | None) -> tuple[str | None, str | None]:
+    """(the prompt, None), or (None, why it cannot be asked honestly today).
+
+    Fixtures return {} when today's data holds no honest target. Asking anyway used to raise KeyError on the
+    prompt's placeholder, so the run was a harness error and the verifier's own "nothing to check" never ran."""
+    if task.get("fixture") and not fixture:
+        return None, "fixture found no target on this instance today"
+    # Every text field of a fixture role, so a prompt can name an order by what it makes ({target_item})
+    # as well as by number ({target_number}).
+    values = {f"{role}_{k}": val for role, v in (fixture or {}).items()
+              if isinstance(v, dict) for k, val in v.items() if isinstance(val, str)}
+    try:
+        return task["prompt"].format(**values), None
+    except KeyError as e:
+        return None, f"the prompt needs {{{e.args[0]}}}, which the fixture did not supply today"
+
+
+def _harness_error(error: str, agent: ProductionAgent | None) -> dict:
+    result = {"run_id": None, "stop_reason": "harness_error", "error": error}
+    if agent is None:  # no model call was ever made, so nothing was spent
+        return {**result, "tokens": dict(NO_TOKENS)}
+    # The agent may have raised mid-step, after spending tokens it never counted: "tokens" stays unknown so the
+    # run's budget keeps this task's whole limit (execute), and what was counted is kept for the record.
+    return {**result, "escalations": agent.escalations, "agent_session_id": agent.session_id,
+            "tokens": None, "tokens_counted": dict(agent.tokens)}
+
+
 def run_one(task: dict, instance: str, root: Path, deadline: float | None = None,
             forced_tool_choice: str = "named", token_budget: int | None = None,
             request_extra: dict | None = None) -> dict:
@@ -151,75 +243,90 @@ def run_one(task: dict, instance: str, root: Path, deadline: float | None = None
     run_dir.mkdir(parents=True, exist_ok=False)
     _write(run_dir / "task.json", task)
 
-    fixture, context, error, mcp = None, None, None, None
+    fixture, context, error, mcp, agent, trace_file, skipped = None, None, None, None, None, None, None
     try:
-        session = Session(instance)
-        mcp = McpClient(session)
-        if task.get("fixture"):
-            fixture = FIXTURES[task["fixture"]](mcp)
-        _write(run_dir / "fixture.json", fixture)
-        context = capture_context(RestClient(session), task)
-        _write(run_dir / "context.json", context)
+        try:
+            session = Session(instance)
+            mcp = McpClient(session)
+            if task.get("fixture"):
+                fixture = FIXTURES[task["fixture"]](mcp)
+            _write(run_dir / "fixture.json", fixture)
+            prompt, skipped = _prompt_for(task, fixture)
+            if skipped is None:
+                context = capture_context(RestClient(session), task)
+                _write(run_dir / "context.json", context)
 
-        trace_file = (run_dir / "trace.jsonl").open("x", encoding="utf-8")
+                trace_file = (run_dir / "trace.jsonl").open("x", encoding="utf-8")
 
-        def trace(event):
-            trace_file.write(json.dumps(event, default=str) + "\n")
-            trace_file.flush()
-            os.fsync(trace_file.fileno())
+                def trace(event):
+                    trace_file.write(json.dumps(event, default=str) + "\n")
+                    trace_file.flush()
+                    os.fsync(trace_file.fileno())
 
-        write_ids = set((fixture or {}).get("write_ids", []))
-        interference: list[dict] = []
+                write_ids = set((fixture or {}).get("write_ids", []))
+                interference: list[dict] = []
 
-        def approve(p):
-            if p["work_order_id"] not in write_ids:  # harness approves fixture rows only
-                return False
-            already_edited = any(i["id"] == p["work_order_id"] for i in interference)
-            if task.get("interference") == "edit_dates_before_apply" and not already_edited:
-                edit = concurrent_edit(McpClient(Session(instance)), p["work_order_id"])
-                interference.append(edit)
-                _write(run_dir / "interference.json", interference)  # on disk before the agent's write attempt
-                trace({"type": "interference", **edit})
-            return True
+                def approve(p):
+                    if p["work_order_id"] not in write_ids:  # harness approves fixture rows only
+                        return False
+                    already_edited = any(i["id"] == p["work_order_id"] for i in interference)
+                    if task.get("interference") == "edit_dates_before_apply" and not already_edited:
+                        edit = concurrent_edit(McpClient(Session(instance)), p["work_order_id"])
+                        interference.append(edit)
+                        _write(run_dir / "interference.json", interference)  # on disk before the agent's write
+                        trace({"type": "interference", **edit})
+                    return True
 
-        # Every text field of a fixture role, so a prompt can name an order by what it makes ({target_item})
-        # as well as by number ({target_number}).
-        prompt = task["prompt"].format(**{f"{role}_{k}": val for role, v in (fixture or {}).items()
-                                          if isinstance(v, dict) for k, val in v.items() if isinstance(val, str)})
-        agent = ProductionAgent(
-            mcp, apply_mode=task.get("mode") == "apply", allowed_write_ids=write_ids, approve=approve,
-            escalate_mode=bool(task.get("escalate")), session_title=f"{config.HARNESS_MARKER} task {task['id']}",
-            trace=trace, max_steps=task.get("max_steps", 20), deadline=deadline,
-            forced_tool_choice=forced_tool_choice, token_budget=token_budget, request_extra=request_extra,
-            require_finding=True)
-        result = agent.run(prompt)
-        trace_file.close()
-    except Exception:
-        error = traceback.format_exc()
-        result = {"run_id": None, "stop_reason": "harness_error", "error": error}
-    result["instance"], result["task_id"] = instance, task["id"]
+                agent = ProductionAgent(
+                    mcp, apply_mode=task.get("mode") == "apply", allowed_write_ids=write_ids, approve=approve,
+                    escalate_mode=bool(task.get("escalate")),
+                    session_title=f"{config.HARNESS_MARKER} task {task['id']}",
+                    trace=trace, max_steps=task.get("max_steps", 20), deadline=deadline,
+                    forced_tool_choice=forced_tool_choice, token_budget=token_budget, request_extra=request_extra,
+                    require_finding=True)
+                result = agent.run(prompt)
+        except Exception:
+            error = traceback.format_exc()
+            result = _harness_error(error, agent)
+        finally:
+            if trace_file is not None:
+                trace_file.close()
+        if skipped is not None:  # the agent never ran: nothing to grade, and no tokens spent on a false premise
+            result = {"run_id": None, "stop_reason": "no_target", "tokens": dict(NO_TOKENS)}
+        result["instance"], result["task_id"] = instance, task["id"]
 
-    def verify():
-        ctx = VerifyContext(rest=RestClient(Session(instance)), instance=instance, task=task,
-                            run_dir=run_dir, fixture=fixture, context=context)
-        return _load_verifier(task["verifier"])(ctx)
+        def verify():
+            ctx = VerifyContext(rest=RestClient(Session(instance)), instance=instance, task=task,
+                                run_dir=run_dir, fixture=fixture, context=context)
+            return _load_verifier(task["verifier"])(ctx)
 
-    if error:
-        verdict, reason = persist_then_verify(run_dir, result, None)
-        reason = "run failed before verification"
-    elif not task.get("verifier"):
-        verdict, reason = persist_then_verify(run_dir, result, None)
-        reason = "no verifier declared"
-    else:
-        verdict, reason = persist_then_verify(run_dir, result, verify)
-    record = {"task_id": task["id"], "instance": instance, "verdict": verdict.value, "reason": reason,
-              "sample": bool(task.get("sample")), "run_id": result.get("run_id"),
-              "seconds": result.get("seconds"), "steps": result.get("steps"), "tokens": result.get("tokens"),
-              "stop_reason": result.get("stop_reason"), "llm_error_code": result.get("llm_error_code")}
-    _write(run_dir / "verdict.json", record)
-    if mcp is not None and result.get("escalations"):
-        _write(run_dir / "cleanup.json", cleanup_escalations(mcp, result))
-    return record
+        if error:
+            verdict, reason = persist_then_verify(run_dir, result, None)
+            reason = "run failed before verification"
+        elif skipped is not None:
+            verdict, reason = persist_then_verify(run_dir, result, None)
+            reason = skipped
+        elif not task.get("verifier"):
+            verdict, reason = persist_then_verify(run_dir, result, None)
+            reason = "no verifier declared"
+        else:
+            verdict, reason = persist_then_verify(run_dir, result, verify)
+        record = {"task_id": task["id"], "instance": instance, "verdict": verdict.value, "reason": reason,
+                  "sample": bool(task.get("sample")), "run_id": result.get("run_id"),
+                  "seconds": result.get("seconds"), "steps": result.get("steps"), "tokens": result.get("tokens"),
+                  "stop_reason": result.get("stop_reason"), "llm_error_code": result.get("llm_error_code")}
+        _write(run_dir / "verdict.json", record)
+        return record
+    finally:
+        # Whatever ended the task (a verdict, an exception from the agent or the verifier, Ctrl-C), an escalation
+        # the agent raised is a real person assigned to a test: withdraw it from the agent's own list, which holds
+        # it even when no result was ever returned. Runs after verdict.json, so verifiers still see it raised.
+        if agent is not None and (agent.escalations or agent.session_id):
+            try:
+                _write(run_dir / "cleanup.json", cleanup_escalations(
+                    mcp, {"escalations": agent.escalations, "agent_session_id": agent.session_id}))
+            except Exception:  # never mask the exception (or interrupt) already on its way out
+                print("cleanup failed:\n" + traceback.format_exc(), file=sys.stderr, flush=True)
 
 
 def cleanup_escalations(mcp: McpClient, result: dict) -> dict:
@@ -294,7 +401,7 @@ def execute(plan: list[tuple[dict, str]], root: Path, book: ResultsBook, *, budg
             token_budget: int | None = None, request_extra: dict | None = None) -> list[dict]:
     """Run the plan, keeping results.json current after every task. With workers > 1 the isolated tasks run that
     many at a time first, then the rest one by one. Under a token budget a task starts only if its whole limit is
-    still free; its limit is held while it runs and what it did not spend is handed back."""
+    still free; its limit is held while it runs and what it did not spend is handed back, if that is known."""
     started, records, lock = clock(), [], threading.Lock()
     held = [0]          # tokens spent by finished tasks plus the limits of running ones
     spent_out = [None]  # set once the platform says the run's budget is gone: no later task can succeed
@@ -330,8 +437,10 @@ def execute(plan: list[tuple[dict, str]], root: Path, book: ResultsBook, *, budg
                    "run_id": None, "seconds": None}
         with lock:
             records.append(rec)
-            if cap is not None:
-                held[0] += ((rec.get("tokens") or {}).get("total") or 0) - cap
+            # Hand back only what a task is known not to have spent. A crash after the agent started leaves its
+            # spend unknown (no "tokens"), and handing the whole limit back could overspend the platform's budget.
+            if cap is not None and rec.get("tokens") is not None:
+                held[0] += (rec["tokens"].get("total") or 0) - cap
             if rec.get("llm_error_code") in NO_CREDIT:
                 spent_out[0] = f"the platform's LLM budget is used up ({rec['llm_error_code']})"
         book.record(task, instance, rec)
@@ -405,10 +514,38 @@ def main() -> int:
         allowed = set(config.INSTANCES) if args.instance == "all" else {args.instance}
     book.label = ", ".join(sorted(allowed))
 
-    tasks = [t for t in load_tasks(args.include_samples) if not args.task or t["id"] in args.task]
+    loaded = load_tasks(args.include_samples)
+    if not platform and args.task:
+        # A typo used to exit 0 with an empty run root; refuse before anything is created. Sample ids are known,
+        # so naming one without --include-samples is caught by the empty-plan check below instead.
+        known = {t["id"] for t in load_tasks(True)}
+        if unknown := sorted(set(args.task) - known):
+            ap.error(f"unknown task id(s): {', '.join(unknown)}")
+    tasks = [t for t in loaded if not args.task or t["id"] in args.task]
     if args.platform_set:
         tasks = [t for t in tasks if t.get("platform")]
     plan = order_plan([(t, i) for t in tasks for i in t.get("instances", sorted(config.INSTANCES)) if i in allowed])
+    # Locally an empty plan is a mistake (a task on an instance it does not declare, a sample without
+    # --include-samples) and would leave an empty run root. Under the platform runner it is not refused: results.json
+    # then carries the failed no_tasks entry, which is what the runner's panel shows (results.py doc()).
+    if not plan and not platform:
+        print(f"no task to run on {book.label}: check --task, --instance, --platform-set and --include-samples "
+              "(a task runs only on the instances its json declares)", file=sys.stderr)
+        return 2
+    try:
+        # The platform runner's copy of the instance is private to this one submission, so nothing else can share
+        # its seat, and a lock problem there would cost the team's one run in three days: only local runs lock.
+        run_lock = None if platform else hold_run_lock()
+    except (RunLocked, OSError) as e:
+        print(f"not started: {e}", file=sys.stderr)
+        return 3
+    try:
+        return _run(args, plan, book, platform)
+    finally:
+        release_run_lock(run_lock)
+
+
+def _run(args, plan: list[tuple[dict, str]], book: ResultsBook, platform: dict | None) -> int:
     for task, instance in plan:
         book.plan(task, instance)
     book.write()  # every planned task is on file before the first one starts
