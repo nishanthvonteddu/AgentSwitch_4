@@ -59,9 +59,21 @@ def test_entity_words_for_suggestions():
     assert domain._words("MachineDowntimeLog") == {"machine", "downtime", "log"}
 
 
-def test_undated_blockers_membership():
+def test_undated_blockers_membership(monkeypatch):
+    """Membership, and what it decides: diagnose marks a signal blocking exactly when it is an undated blocker."""
+    from test_behaviour_fakes import Book, pin_today, schedule_entry, work_order
+
     assert "subcontract_not_sent" in domain.UNDATED_BLOCKERS
     assert "workstation_downtime" not in domain.UNDATED_BLOCKERS
+    pin_today(monkeypatch)
+    wo = work_order("WO-2026-00048", "in_progress", end="2026-09-30")
+    book = Book(tables={"WorkOrder": [wo], "SubcontractOrder": [
+                    {"id": "sco-30", "number": "SCO-2026-00030", "work_order_id": wo["id"], "status": "draft"}]},
+                schedule=[{**schedule_entry(wo), "operations": [{"workstation_id": "ws-1", "workstation_label": "WS-1"}]}],
+                workstation_load=[{"workstation_id": "ws-1", "record_label": "WS-1", "state": "available",
+                                   "downtime_minutes": 95.0}])
+    weight = {s["code"]: s["blocking"] for s in domain.diagnose(book, "WO-2026-00048")["signals"]}
+    assert weight == {"subcontract_not_sent": True, "workstation_downtime": False}
 
 
 def test_today_can_be_pinned(monkeypatch):

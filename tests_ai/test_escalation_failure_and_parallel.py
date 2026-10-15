@@ -343,59 +343,73 @@ def test_list_window_pushes_the_equality_filter_to_the_server():
     assert paging.filters[0]["sort_by"] == "from_time" and paging.filters[0]["sort_order"] == "desc"
 
 
+def _reschedule_book(monkeypatch):
+    """Two draft orders over the in-memory book the behaviour tests use, so every read has its real shape."""
+    from test_behaviour_fakes import Book, pin_today, work_order
+
+    pin_today(monkeypatch)
+    return Book(tables={"WorkOrder": [work_order("WO-1", "draft", start="2026-09-01", end="2026-09-05"),
+                                      work_order("WO-2", "draft", start="2026-09-02", end="2026-09-06")]})
+
+
+def _spy(monkeypatch, module, name, log):
+    """Wrap the real function, recording each call's arguments."""
+    real = getattr(module, name)
+
+    def spy(*args, **kwargs):
+        log.append((name, args, kwargs))
+        return real(*args, **kwargs)
+    monkeypatch.setattr(module, name, spy)
+
+
 def test_propose_reschedule_reuses_handed_in_reads(monkeypatch):
     from prod_agent import domain
 
-    refetched = []
-    monkeypatch.setattr(domain, "diagnose", lambda *a, **k: refetched.append("diagnose") or {"found": False})
-    monkeypatch.setattr(domain, "downstream_impact", lambda *a, **k: refetched.append("downstream") or {})
+    book = _reschedule_book(monkeypatch)
+    diag, down = domain.diagnose(book, "WO-1"), domain.downstream_impact(book, "WO-1")
+    book.calls.clear()
 
-    diag = {"found": True, "work_order": {"id": "w1", "number": "WO-1", "status": "in_progress",
-                                          "planned_start_date": "2026-09-01", "planned_end_date": "2026-09-05",
-                                          "updated_at": "t0"},
-            "signals": [], "schedule": {}}
-    down = {"potentially_blocked_work_orders": []}
+    out = domain.propose_reschedule(book, "WO-1", diag=diag, down=down)
 
-    out = domain.propose_reschedule(object(), "WO-1", diag=diag, down=down)
-
-    assert refetched == [], "propose_reschedule refetched work it was handed"
+    assert book.calls == [], "propose_reschedule refetched work it was handed"
     assert out["found"] is True and out["work_order"]["number"] == "WO-1"
+    assert [p["number"] for p in out["proposals"]] == ["WO-1"]
 
 
 def test_agent_hands_cached_reads_to_propose_reschedule(monkeypatch):
     from prod_agent import domain
 
-    seen = {}
-    monkeypatch.setattr(domain, "diagnose", lambda mcp, ref: {"found": True, "tag": "diag"})
-    monkeypatch.setattr(domain, "downstream_impact", lambda mcp, ref: {"found": True, "tag": "down"})
-    monkeypatch.setattr(domain, "propose_reschedule",
-                        lambda mcp, ref, diag=None, down=None: seen.update(diag=diag, down=down) or {"proposals": []})
+    book = _reschedule_book(monkeypatch)
+    log = []
+    for name in ("diagnose", "downstream_impact", "propose_reschedule"):
+        _spy(monkeypatch, domain, name, log)
+    agent = ProductionAgent(book, llm=object(), model="gpt-4.1")
 
-    agent = batch_agent(None)
-    del agent._dispatch  # use the real one
-    agent._dispatch("diagnose_work_order", {"work_order": "WO-1"})
-    agent._dispatch("downstream_impact", {"work_order": "WO-1"})
+    diag = agent._dispatch("diagnose_work_order", {"work_order": "WO-1"})
+    down = agent._dispatch("downstream_impact", {"work_order": "WO-1"})
     agent._dispatch("propose_reschedule", {"work_order": "WO-1"})
 
-    assert seen["diag"] == {"found": True, "tag": "diag"}
-    assert seen["down"] == {"found": True, "tag": "down"}
+    [(_, _, handed)] = [entry for entry in log if entry[0] == "propose_reschedule"]
+    assert handed["diag"] is diag and handed["down"] is down
+    assert [entry[0] for entry in log].count("diagnose") == 1, "the diagnosis was run again"
+    assert [entry[0] for entry in log].count("downstream_impact") == 1
 
 
 def test_agent_does_not_reuse_a_read_for_a_different_work_order(monkeypatch):
     from prod_agent import domain
 
-    seen = {}
-    monkeypatch.setattr(domain, "diagnose", lambda mcp, ref: {"found": True, "ref": ref})
-    monkeypatch.setattr(domain, "propose_reschedule",
-                        lambda mcp, ref, diag=None, down=None: seen.update(diag=diag) or {"proposals": []})
+    book = _reschedule_book(monkeypatch)
+    log = []
+    _spy(monkeypatch, domain, "propose_reschedule", log)
+    agent = ProductionAgent(book, llm=object(), model="gpt-4.1")
 
-    agent = batch_agent(None)
-    del agent._dispatch
     agent._dispatch("diagnose_work_order", {"work_order": "WO-1"})
     agent._dispatch("propose_reschedule", {"work_order": "WO-2"})
 
     # propose_reschedule now always plans from a diagnosis (2026-10-12), but it must be WO-2's own.
-    assert seen["diag"] == {"found": True, "ref": "WO-2"}, "a cached diagnosis leaked across work orders"
+    [(_, _, handed)] = log
+    assert handed["diag"]["work_order"]["number"] == "WO-2", "a cached diagnosis leaked across work orders"
+
 
 
 # --------------------------------------------------------------- 5. incomplete findings

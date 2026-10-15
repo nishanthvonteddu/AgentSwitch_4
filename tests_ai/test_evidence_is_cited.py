@@ -9,37 +9,41 @@ that forced call, still typed the draft subcontract numbers into evidence_record
 requires. The record that proves each cause is already in the loop's diagnosis, so these pin that a
 finding cites it whatever the model retyped.
 
+The diagnosis is the real domain.diagnose over an in-memory book (test_behaviour_fakes.Book), so the signals
+have exactly the shape and blocking flags production gives them: a material shortage is an undated blocker,
+and a finite_schedule cause with no workstation carries no record.
+
 Run: python -m pytest tests_ai/test_evidence_is_cited.py -q
 """
-from types import SimpleNamespace
-
 import pytest
+from test_behaviour_fakes import Book, agent_on, finding, pin_today, schedule_entry, work_order
 
-from prod_agent import domain
-from prod_agent.agent import ProductionAgent
+WO48 = work_order("WO-2026-00048", "in_progress", start="2026-08-01", end="2026-08-20")
 
-WO48 = {"id": "5f0c1e8a-0000-4000-8000-000000000048", "number": "WO-2026-00048"}
-DIAG = {"found": True, "work_order": WO48, "signals": [
-    {"code": "subcontract_not_sent", "blocking": True, "record": "SCO-2026-00011"},
-    {"code": "subcontract_not_sent", "blocking": True, "record": "SCO-2026-00012"},
-    {"code": "material_shortage", "blocking": False, "record": "item-7"},
-    {"code": "stock_check_unreliable", "blocking": False, "record": None}]}
+
+def _sco(number):
+    return {"id": f"id-{number}", "number": number, "work_order_id": WO48["id"], "status": "draft",
+            "expected_delivery_date": None, "vendor_id": "v-1", "_vendor_id_display": "Anand Platers"}
 
 
 @pytest.fixture
 def agent(monkeypatch):
-    monkeypatch.setattr(domain, "diagnose", lambda mcp, ref: DIAG if ref.upper() == WO48["number"]
-                        else {"found": False, "ref": ref})
-    a = ProductionAgent(SimpleNamespace(session=SimpleNamespace(instance="suryodaya")), llm=object(), model="m")
-    a._dispatch("diagnose_work_order", {"work_order": WO48["number"]})
+    pin_today(monkeypatch)
+    book = Book(tables={"WorkOrder": [WO48], "SubcontractOrder": [_sco("SCO-2026-00011"), _sco("SCO-2026-00012")]},
+                stock={WO48["id"]: [{"item_id": "item-7", "required": 5, "available": 2, "shortage": 3,
+                                     "is_critical": True}]},
+                schedule=[schedule_entry(WO48, "late", causes=[
+                    {"code": "operator_shortage", "workstation_label": None, "minutes": 30}])])
+    a = agent_on(book)
+    diag = a._dispatch("diagnose_work_order", {"work_order": WO48["number"]})
+    assert [(s["code"], s["blocking"], s["record"]) for s in diag["signals"]] == [
+        ("subcontract_not_sent", True, "SCO-2026-00011"), ("subcontract_not_sent", True, "SCO-2026-00012"),
+        ("material_shortage", True, "item-7"), ("schedule_operator_shortage", False, None)]
     return a
 
 
 def _finding(**over):
-    return {"outcome": "answered", "work_order": WO48["number"], "is_late": True, "currency": "INR",
-            "blocking_causes": ["subcontract_not_sent"], "contributing_causes": [], "evidence_records": [],
-            "potentially_blocked_work_orders": [], "blocked_sales_orders": [], "rescheduled": [],
-            "not_visible": [], "refusal_reason": None, **over}
+    return {**finding(WO48["number"], blocking_causes=["subcontract_not_sent"]), **over}
 
 
 def test_every_record_that_proves_a_named_cause_is_cited(agent):
@@ -53,37 +57,39 @@ def test_the_models_own_citations_stay_first_and_are_not_repeated(agent):
 
 
 def test_a_cause_the_finding_does_not_name_is_not_cited(agent):
-    out = agent._cite_evidence(_finding(blocking_causes=[], contributing_causes=["material_shortage"]))
+    out = agent._cite_evidence(_finding(blocking_causes=["material_shortage"]))
     assert out["evidence_records"] == ["item-7"]
 
 
 def test_a_signal_with_no_record_adds_nothing(agent):
-    finding = _finding(blocking_causes=[], contributing_causes=["stock_check_unreliable"])
-    assert agent._cite_evidence(finding) == finding
+    finding_ = _finding(blocking_causes=[], contributing_causes=["schedule_operator_shortage"])
+    assert agent._cite_evidence(finding_) == finding_
 
 
 @pytest.mark.parametrize("outcome", ["refused", None])
 def test_a_refusal_or_an_unfinished_finding_is_left_alone(agent, outcome):
-    finding = _finding(outcome=outcome)
-    assert agent._cite_evidence(finding) == finding
+    finding_ = _finding(outcome=outcome)
+    assert agent._cite_evidence(finding_) == finding_
 
 
 def test_a_wrong_shape_is_left_for_the_shape_guard(agent):
-    finding = _finding(evidence_records="SCO-2026-00011")
-    assert agent._cite_evidence(finding) == finding
+    finding_ = _finding(evidence_records="SCO-2026-00011")
+    assert agent._cite_evidence(finding_) == finding_
 
 
 def test_an_order_never_diagnosed_is_left_alone(agent):
-    finding = _finding(work_order="WO-2026-00049")
-    assert agent._cite_evidence(finding) == finding
+    finding_ = _finding(work_order="WO-2026-00049")
+    assert agent._cite_evidence(finding_) == finding_
 
 
 def test_the_whole_record_path_cites_the_subcontracts(agent):
     """Through record_finding itself, as the forced finding at the token limit would arrive."""
-    saved = []
-    agent.mcp.call = lambda name, args: saved.append(args) or {"id": "mem-1"}
-
     agent._dispatch("record_finding", _finding())
 
     assert agent.finding["evidence_records"][:2] == ["SCO-2026-00011", "SCO-2026-00012"]
-    assert "SCO-2026-00012" in saved[0]["content"]
+    [stored] = agent.mcp.recorded_findings()
+    assert stored["evidence_records"][:2] == ["SCO-2026-00011", "SCO-2026-00012"]
+    # The causes the model left out are restored too, each with the weight diagnose gave it, and cited.
+    assert stored["blocking_causes"] == ["subcontract_not_sent", "material_shortage"]
+    assert stored["contributing_causes"] == ["schedule_operator_shortage"]
+    assert "item-7" in stored["evidence_records"]
