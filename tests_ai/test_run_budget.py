@@ -129,7 +129,9 @@ def test_isolated_tasks_overlap_and_writers_always_run_alone(monkeypatch, tmp_pa
         with lock:
             active[0] += 1
             seen[task["id"]] = active[0]
-        if task["mode"] == "dry_run":
+        # Only the readers meet at the barrier. The escalating task is dry_run too, and once waited here alone: it
+        # stalled the full timeout, and execute() swallowed the BrokenBarrierError into an unevaluated record.
+        if runner.isolated(task):
             all_isolated_running.wait()  # only passes if all three are in flight at once
         with lock:
             active[0] -= 1
@@ -144,6 +146,11 @@ def test_isolated_tasks_overlap_and_writers_always_run_alone(monkeypatch, tmp_pa
 
     assert seen["write"] == 1 and seen["escalate"] == 1
     assert [r["task_id"] for r in records][-2:] == ["write", "escalate"], "readers go first, then writers one by one"
+    # Every task really ran to its verdict: a reader stuck at the barrier, or a writer that waited on it, would
+    # come back unevaluated ("harness error: BrokenBarrierError") and still pass the ordering checks above.
+    assert {r["task_id"]: r["verdict"] for r in records} == {
+        "read0": "approve", "read1": "approve", "read2": "approve", "write": "approve", "escalate": "approve"}
+    assert not all_isolated_running.broken
 
 
 # ----------------------------------------------------------------------------- the agent under a deadline
