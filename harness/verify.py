@@ -4,13 +4,19 @@ A verifier is `def check(ctx: VerifyContext) -> Verdict | tuple[Verdict, str]`.
 It must decide from the database (ctx.rest / ctx.finding_from_db()), not from ctx.result["final_answer"].
 Any exception inside a verifier yields UNEVALUATED, which never counts as a pass.
 """
+import datetime as dt
 import enum
 import json
 from pathlib import Path
 
 from prod_agent import config
-from prod_agent.mcp_client import RestClient
+from prod_agent.mcp_client import LIST_ALL_MAX_ROWS, RestClient
 
+# AgentMemory rows are large (a 200-row page was 338 KB on 2026-10-07), so the page stays at 200; the scan stops at the
+# same ceiling as every other table read.
+FINDING_PAGE = 200
+FINDING_SCAN_MAX_ROWS = LIST_ALL_MAX_ROWS
+FINDING_CLOCK_MARGIN = dt.timedelta(minutes=10)
 
 NULL_LIKE_STRINGS = {"", "n/a", "na", "nil", "none", "null"}
 TOP_LEVEL_NULLABLE_FIELDS = ("work_order", "is_late", "currency", "cost", "refusal_reason")
@@ -68,17 +74,66 @@ class VerifyContext:
         return [e for e in self.trace_events() if e.get("type") == "tool"]
 
     def finding_from_db(self) -> dict | None:
-        """The finding this run wrote to AgentMemory, read back over REST. None if it never landed."""
-        rows = self.rest.raw("/api/AgentMemory", sort_by="created_at", sort_order="desc", limit=200).get("data", [])
-        for row in rows:
-            content = row.get("content") or ""
-            if content.startswith(config.FINDING_PREFIX):
-                payload = json.loads(content[len(config.FINDING_PREFIX):])
-                if payload.get("run_id") == self.run_id:
-                    # Some models emit JSON null as a quoted string in otherwise valid findings.
-                    _normalise_null_like_strings(payload)
-                    return {**payload, "_agent_memory_id": row["id"], "_created_by": row.get("created_by")}
+        """The finding this run wrote to AgentMemory, read back over REST. None if it never landed.
+
+        AgentMemory is shared with every other run and team on the tenant and REST has no proven content filter,
+        so this pages newest-first until the finding turns up. It stops early only once the rows read so far are
+        observed to be newest-first and reach back before the run started (less a clock margin; the finding is written
+        after the start), so a server that ignores sort_order (B14) costs a longer read, never a wrong None. A row nobody can parse is
+        another run's problem and is skipped; one that names this run and still cannot be parsed raises, as does
+        passing FINDING_SCAN_MAX_ROWS, because "no finding" would score REVISE where the truth is unknown.
+        """
+        cutoff = self._finding_cutoff()
+        offset, unparsed_own, previous, descending, past_start = 0, None, None, None, False
+        while not past_start:
+            page = self.rest.raw("/api/AgentMemory", sort_by="created_at", sort_order="desc",
+                                 limit=FINDING_PAGE, offset=offset)
+            rows = page.get("data", []) if isinstance(page, dict) else []
+            for row in rows:
+                content = row.get("content")
+                if isinstance(content, str) and content.startswith(config.FINDING_PREFIX):
+                    try:
+                        payload = json.loads(content[len(config.FINDING_PREFIX):])
+                    except ValueError:
+                        payload = None
+                    if not isinstance(payload, dict):
+                        if self.run_id and self.run_id in content:
+                            unparsed_own = row.get("id")
+                        continue
+                    if payload.get("run_id") == self.run_id:
+                        # Some models emit JSON null as a quoted string in otherwise valid findings.
+                        _normalise_null_like_strings(payload)
+                        return {**payload, "_agent_memory_id": row["id"], "_created_by": row.get("created_by")}
+                created = row.get("created_at")
+                if isinstance(created, str) and created:
+                    # None until a strict decrease is seen: one row, or rows that all tie, prove no direction.
+                    if previous is not None and created != previous and descending is not False:
+                        descending = created < previous
+                    previous = created
+                    if descending and cutoff and created < cutoff:
+                        past_start = True
+                        break
+            offset += len(rows)
+            total = page.get("total") if isinstance(page, dict) else None
+            if not rows or (offset >= total if isinstance(total, int) else len(rows) < FINDING_PAGE):
+                break
+            if offset >= FINDING_SCAN_MAX_ROWS and not past_start:
+                raise RuntimeError(f"no finding for run {self.run_id} in the newest {offset} AgentMemory rows; "
+                                   "read no further, so whether it landed is unknown")
+        if unparsed_own:
+            raise ValueError(f"AgentMemory row {unparsed_own} names run {self.run_id} but is not a JSON object")
         return None
+
+    def _finding_cutoff(self) -> str | None:
+        """created_at before which no row can be this run's finding, or None to read without an early stop.
+
+        started_at_utc is normally the server's own clock, but capture_context falls back to ours when the Date
+        header is unreadable, so the cutoff keeps a margin for skew rather than trusting the two clocks to agree."""
+        try:
+            started = dt.datetime.fromisoformat(self.started_at) if isinstance(self.started_at, str) else None
+        except ValueError:
+            return None
+        return (started - FINDING_CLOCK_MARGIN).replace(tzinfo=None).isoformat() if started else None
 
     def seat_tool_names(self) -> set[str]:
         """The MCP catalogue for this seat. Seat rules are defined by it, so this one read uses MCP."""

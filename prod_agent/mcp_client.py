@@ -284,6 +284,14 @@ class McpClient:
 class RestClient:
     """Read-only REST access. Verifiers use this so they never share a code path with the agent."""
 
+    PAGE = 200
+    MAX_ROWS = LIST_ALL_MAX_ROWS
+
+    class TooManyRows(RuntimeError):
+        """A table read passed MAX_ROWS. Raised rather than returning the rows read so far: every caller treats the
+        result as the whole table, so a partial one would grade silently against a wrong ground truth. A verifier
+        that raises scores UNEVALUATED, which never counts as a pass."""
+
     def __init__(self, session: Session):
         self.session = session
 
@@ -300,14 +308,22 @@ class RestClient:
         return self._get(f"/api/{entity}/{urllib.parse.quote(record_id)}")
 
     def list(self, entity: str, **params) -> list[dict]:
+        """Every row of `entity` matching `params`, or TooManyRows past MAX_ROWS.
+
+        Ends on `total` when the payload carries one (a short page then only means the server caps its page size);
+        without it, on the first empty or short page. Reading `total` as 0 when it was absent once ended every read
+        after its first page. Paging keys go last so a filter can never override them and page forever."""
         rows, offset = [], 0
         while True:
-            payload = self._get(f"/api/{entity}", {"limit": 200, "offset": offset, **params})
+            payload = self._get(f"/api/{entity}", {**params, "limit": self.PAGE, "offset": offset})
             batch = payload.get("data", [])
+            total = payload.get("total")
             rows.extend(batch)
             offset += len(batch)
-            if not batch or offset >= payload.get("total", 0):
+            if not batch or (offset >= total if isinstance(total, int) else len(batch) < self.PAGE):
                 return rows
+            if len(rows) > self.MAX_ROWS:
+                raise self.TooManyRows(f"/api/{entity} passed {self.MAX_ROWS} rows (total {total}) with {params}")
 
     def raw(self, path: str, **params):
         return self._get(path, params or None)
