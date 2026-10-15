@@ -11,14 +11,20 @@ from prod_agent import domain
 from prod_agent.mcp_client import RowPage
 
 
+def _no_network(fn):
+    raise AssertionError("this fake has no network; patch domain._rest_status")
+
+
 class GroupMcp:
     def __init__(self, rows, total=None, truncated=False, tools=("AgentJob.list",)):
         self._rows, self._tools = rows, set(tools)
         self._total = total if total is not None else len(rows)
         self._truncated = truncated
         self.calls = []
+        # seat_capability falls through to a REST probe (domain._rest_status). A test that reaches it patches
+        # it; anything else that tries the network here fails closed instead of waiting on DNS retries.
         self.session = type("S", (), {"base": "https://example.invalid", "token": None,
-                                      "with_reauth": staticmethod(lambda fn: fn())})()
+                                      "with_reauth": staticmethod(_no_network)})()
 
     def has_tool(self, name):
         return name in self._tools
@@ -115,9 +121,14 @@ def test_a_high_cardinality_field_reports_a_top_slice_and_sums_the_tail():
 
 # --------------------------------------------------------------- boundary and wiring
 
-def test_entity_outside_the_seat_is_refused():
-    out = domain.query_group(GroupMcp([], tools=("AgentJob.list",)), "SalarySlip", "status")
+def test_entity_outside_the_seat_is_refused(monkeypatch):
+    probed = []
+    monkeypatch.setattr(domain, "_rest_status", lambda mcp, entity: probed.append(entity) or 403)
+    mcp = GroupMcp([], tools=("AgentJob.list",))
+    out = domain.query_group(mcp, "SalarySlip", "status")
     assert out["error"] == "not readable by this seat"
+    assert out["outside_seat"] is True and probed == ["SalarySlip"]
+    assert mcp.calls == [], "nothing is read for an entity the seat cannot list"
 
 
 def test_filters_are_passed_to_the_read():

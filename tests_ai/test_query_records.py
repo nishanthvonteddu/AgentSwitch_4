@@ -10,15 +10,20 @@ import pytest
 from prod_agent import domain
 
 
+def _no_network(fn):
+    raise AssertionError("this fake has no network; patch domain._rest_status")
+
+
 class FakeMcp:
     """Records every .list call so a test can assert what was NOT fetched."""
 
     def __init__(self, total=0, rows=None, tools=("WorkOrder.list",), error=None):
         self.total, self._rows, self._tools, self._error = total, rows or [], set(tools), error
         self.calls = []
-        # seat_capability falls through to a REST probe; give it something that fails closed.
+        # seat_capability falls through to a REST probe (domain._rest_status). A test that reaches it patches
+        # it; anything else that tries the network here fails closed instead of waiting on DNS retries.
         self.session = type("S", (), {"base": "https://example.invalid", "token": None,
-                                      "with_reauth": staticmethod(lambda fn: fn())})()
+                                      "with_reauth": staticmethod(_no_network)})()
 
     def has_tool(self, name):
         return name in self._tools
@@ -112,12 +117,28 @@ def test_never_calls_a_write_tool():
     assert all(name.endswith(".list") for name, _ in mcp.calls)
 
 
-def test_entity_outside_the_seat_is_refused_through_the_existing_probe():
+def _rest(monkeypatch, status):
+    """seat_capability's REST probe, answered here: 403 = a real entity outside the seat, 404 = no such entity."""
+    probed = []
+    monkeypatch.setattr(domain, "_rest_status", lambda mcp, entity: probed.append(entity) or status)
+    return probed
+
+
+def test_entity_outside_the_seat_is_refused_through_the_existing_probe(monkeypatch):
+    probed = _rest(monkeypatch, 403)
     mcp = FakeMcp(total=0, tools=("WorkOrder.list",))
     out = domain.query_records(mcp, "SalarySlip")
     assert out["error"] == "not readable by this seat"
     assert out["entity"] == "SalarySlip"
+    assert out["outside_seat"] is True and probed == ["SalarySlip"]
     assert not any(name.startswith("SalarySlip") for name, _ in mcp.calls), "must not call a tool it lacks"
+
+
+def test_an_invented_entity_is_refused_with_a_warning_not_as_a_seat_limit(monkeypatch):
+    _rest(monkeypatch, 404)
+    out = domain.query_records(FakeMcp(total=0, tools=("WorkOrder.list",)), "MachineDowntimeLog")
+    assert out["error"] == "not readable by this seat"
+    assert "outside_seat" not in out and "not an entity" in out["warning"]
 
 
 def test_paging_controls_cannot_be_smuggled_in_as_filters():
@@ -177,14 +198,17 @@ def test_agent_exposes_it_as_a_fallback_and_guards_it_like_other_reads():
 def test_the_filter_description_matches_what_was_verified():
     """Verified over MCP on Suryodaya 2026-09-29: a comma list works (draft,not_started returned
     40 + 38 = 78); lt:/gte:/between: are rejected, because the tool schema declares the field
-    {"format": "date"}. The description must say both, or the model guesses at one of them."""
-    from prod_agent import agent
-    text = open(agent.__file__).read()
-    i = text.index('_fn("query_records"')
-    described = text[i:i + 1400]
+    {"format": "date"}. The description must say both, or the model guesses at one of them. Read from
+    the tool spec the model is actually sent, not from the source file."""
+    from prod_agent.agent import ProductionAgent
+    [spec] = [t["function"] for t in ProductionAgent(None, llm=object(), model="gpt-4.1").tool_specs()
+              if t["function"]["name"] == "query_records"]
+    described = spec["parameters"]["properties"]["filters"]["description"]
     assert "comma list" in described and "means OR" in described
     assert "NOT available here" in described
     assert "lt:/gte:/between:" in described
+    assert spec["parameters"]["properties"]["limit"]["maximum"] == domain.QUERY_MAX_ROWS
+    assert spec["parameters"]["required"] == ["entity"]
 
 
 # --------------------------------------------------------------- size, not row count

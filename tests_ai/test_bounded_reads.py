@@ -6,7 +6,7 @@ halves: the ceiling that stops the paging, and the note that makes a cut visible
 """
 import json
 
-import pytest
+from test_behaviour_fakes import DATE_OPERATORS, Book, work_order
 
 from prod_agent import domain
 from prod_agent.agent import TOOL_CONTENT_LIMIT, _tool_content
@@ -71,32 +71,84 @@ def test_filters_are_sent_on_every_page():
     assert all(args.get("status") == "draft,not_started" for _, args in mcp.calls)
 
 
+def _shop(**kwargs):
+    """Open and closed orders, cards and changes, plus what each domain read needs to run end to end."""
+    wo = work_order("WO-2026-00048", "in_progress", start="2026-09-01", end="2026-09-10")
+    return wo, Book(tables={
+        "WorkOrder": [wo, work_order("WO-2026-00028", "completed", end="2026-05-10", bom_id="bom-x"),
+                      work_order("WO-2026-00031", "cancelled", end="2026-06-10", bom_id="bom-x")],
+        "BOM": [{"id": "bom-x", "number": "BOM-X", "materials": [{"item_id": wo["item_id"], "qty": 1}]}],
+        "JobCard": [{"id": "jc-1", "number": "JC-1", "work_order_id": wo["id"], "status": "open", "time_in_mins": 10,
+                     "for_qty": 5, "workstation_id": "ws-1"},
+                    {"id": "jc-2", "number": "JC-2", "work_order_id": wo["id"], "status": "completed",
+                     "time_in_mins": 999, "for_qty": 999, "workstation_id": "ws-1"}],
+        "EngineeringChangeOrder": [
+            {"id": "eco-1", "number": "ECO-1", "status": "submitted", "affected_work_orders": [{"work_order_id": wo["id"]}]},
+            {"id": "eco-2", "number": "ECO-2", "status": "implemented", "affected_work_orders": [{"work_order_id": wo["id"]}]}],
+        "DowntimeEntry": [{"id": "d-1", "workstation_id": "ws-1", "reason": "breakdown", "from_time": "2026-09-14T08:00:00",
+                           "to_time": "2026-09-14T10:00:00", "downtime_mins": 120}],
+        "Workstation": [{"id": "ws-1", "number": "WS-1", "name": "Press", "working_hours_per_day": 8, "capacity": 1}],
+        "Company": [{"id": f"other-co-{i}", "name": f"Company {i}"} for i in range(300)] + [
+            {"id": "co-1", "name": "Suryodaya Precision", "country": "India", "default_currency": "INR"}],
+        "Item": [{"id": wo["item_id"], "code": "FG-1", "number": "ITEM-1", "name": "Bracket"}]},
+        tools={"EngineeringChangeOrder.list", "JobCard.list", "DowntimeEntry.list"},
+        endpoints={"endpoint.manufacturing.capacity_board": {"result": {"counts": {
+            "booked_minutes": 50, "available_minutes": 10000}}}}, **kwargs)
+
+
+def _every_read(wo, book):
+    domain.list_late_work_orders(book)
+    domain.diagnose(book, wo["number"])
+    domain.downstream_impact(book, wo["number"])
+    domain.capacity_outlook(book)
+    domain.order_feasible_by(book, wo["number"], "2026-12-01")
+    domain.downtime_summary(book, 30)
+    domain.find_orders_for_item(book, "FG-1")
+    domain.company_context(book)
+
+
 def test_status_scans_are_narrowed_at_the_server():
     """Confirmed over MCP on Suryodaya 2026-09-29: status=draft,not_started returned 78 = 40 + 38."""
-    text = open(domain.__file__).read()
-    assert 'mcp.list_all("WorkOrder", status=_csv(OPEN_WO))' in text
-    assert 'mcp.list_all("EngineeringChangeOrder", status=_csv(PENDING_ECO))' in text
+    wo, book = _shop()
+    _every_read(wo, book)
+    sent = {}
+    for name, args in book.calls:
+        if "status" in args:
+            sent.setdefault(name, set()).add(args["status"])
+    assert sent["WorkOrder.list"] >= {"draft,in_progress,not_started,stopped"}
+    assert sent["EngineeringChangeOrder.list"] == {"draft,submitted,under_review"}
+    assert sent["JobCard.list"] == {"in_progress,not_started,open,paused"}
     assert domain._csv(domain.OPEN_WO) == "draft,in_progress,not_started,stopped"
 
 
 def test_date_operators_are_not_used_on_this_interface():
     """The MCP schema declares planned_end_date {"format": "date"} and rejects lt:/gte:/between:,
-    though REST accepts them on the same login. Filed as a bug; not usable here meanwhile."""
-    text = open(domain.__file__).read()
-    assert "lt:" not in text.split("def _csv")[0], "no date operator may reach an MCP .list call"
+    though REST accepts them on the same login. Filed as a bug; not usable here meanwhile. The fake book
+    rejects them the same way, so every domain read below would raise if one were sent."""
+    wo, book = _shop()
+    _every_read(wo, book)
+    sent = [str(v) for _, args in book.calls for v in args.values()]
+    assert not [v for v in sent if v.split(":", 1)[0] in DATE_OPERATORS]
 
 
 def test_python_status_checks_are_kept_as_well():
     """A server filter this platform ignores must not silently widen the result."""
-    text = open(domain.__file__).read()
-    assert 'if wo.get("status") not in OPEN_WO' in text
-    assert 'if c.get("status") in OPEN_JOB_CARD' in text
+    wo, book = _shop(ignored_filters={"status"})
+    assert [r["number"] for r in domain.list_late_work_orders(book)] == ["WO-2026-00048"]
+    assert domain.downstream_impact(book, wo["number"])["potentially_blocked_work_orders"] == []
+    assert [s["record"] for s in domain.diagnose(book, wo["number"])["signals"]
+            if s["code"] == "engineering_change_pending"] == ["ECO-1"]
+    assert domain.capacity_outlook(book)["work_content"]["minutes"] == 50.0, "the completed card must not count"
+    assert domain.order_feasible_by(book, wo["number"], "2026-12-01")["remaining_work_content_minutes"] == 50.0
 
 
 def test_company_context_reads_one_row_not_the_table():
-    text = open(domain.__file__).read()
-    assert 'mcp.list_all("Company")' not in text
-    assert 'mcp.call("Company.list", {"limit": 1})' in text
+    wo, book = _shop()
+    out = domain.company_context(book)
+    assert out["currency"] == "INR" and out["country"] == "India"
+    company_reads = [args for name, args in book.calls if name == "Company.list"]
+    assert company_reads == [{"limit": 1}], "one row, never the table"
+    assert [args for name, args in book.calls if name == "Company.get"] == [{"id": "co-1"}]
 
 
 # --------------------------------------------------------------- truncation is never silent

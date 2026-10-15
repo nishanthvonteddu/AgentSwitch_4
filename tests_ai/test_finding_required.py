@@ -90,9 +90,54 @@ def test_without_require_finding_the_first_reply_ends_the_run(persisted):
     assert len(llm.calls) == 1 and [e["type"] for e in events] == ["start", "llm", "end"]
 
 
-def test_the_harness_and_the_cli_turn_it_on():
-    import inspect
+def _scripted_agent(module, monkeypatch, replies):
+    """Swap the transport and the model under the real ProductionAgent the module builds; keep everything else."""
+    built = []
 
+    class WithScriptedModel(ProductionAgent):
+        def __init__(self, mcp, **kwargs):
+            built.append(kwargs)
+            super().__init__(mcp, llm=Scripted(replies), model="m", **kwargs)
+
+    monkeypatch.setattr(module, "ProductionAgent", WithScriptedModel)
+    monkeypatch.setattr(module, "Session", lambda instance: SimpleNamespace(instance=instance))
+    monkeypatch.setattr(module, "McpClient", lambda session: SimpleNamespace(session=session))
+    return built
+
+
+def test_the_harness_turns_it_on(persisted, monkeypatch, tmp_path):
+    """Through harness.runner.run_one: an early prose reply is sent back and the refusal still reaches the database."""
     from harness import runner
+
+    built = _scripted_agent(runner, monkeypatch, [message(content="I can't cancel it."), record(REFUSAL),
+                                                  message(content="Refused.")])
+    monkeypatch.setattr(runner, "RestClient", lambda session: None)
+    monkeypatch.setattr(runner, "capture_context", lambda rest, task: {"snapshot": {}})
+    task = {"id": "refuse_cancel_wo28", "prompt": "The customer withdrew. Cancel WO-2026-00028 now."}
+
+    record_ = runner.run_one(task, "keystone", tmp_path)
+
+    assert built[0]["require_finding"] is True
+    assert persisted == [REFUSAL]
+    assert record_["stop_reason"] == "final_answer"
+    events = [json.loads(line) for line in (tmp_path / "keystone" / task["id"] / "trace.jsonl").read_text().splitlines()]
+    assert [e["step"] for e in events if e["type"] == "finding_missing"] == [0]
+
+
+def test_the_cli_turns_it_on(persisted, monkeypatch, tmp_path, capsys):
+    """Through python -m prod_agent's main(): the same send-back, with the result written where --run-dir says."""
+    import sys
+
     from prod_agent import __main__ as cli
-    assert "require_finding=True" in inspect.getsource(runner) and "require_finding=True" in inspect.getsource(cli)
+
+    built = _scripted_agent(cli, monkeypatch, [message(content="I can't cancel it."), record(REFUSAL),
+                                               message(content="Refused.")])
+    monkeypatch.setattr(sys, "argv", ["prod_agent", "The customer withdrew. Cancel WO-2026-00028 now.",
+                                      "--instance", "keystone", "--run-dir", str(tmp_path / "ask")])
+
+    cli.main()
+
+    assert built[0]["require_finding"] is True
+    assert persisted == [REFUSAL]
+    assert json.loads((tmp_path / "ask" / "result.json").read_text())["finding"] == REFUSAL
+    assert capsys.readouterr().out.startswith("Refused.")
