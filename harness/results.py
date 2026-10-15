@@ -12,8 +12,10 @@ rewritten, whole, after every verdict.
 Written with Claude (AI-assisted).
 """
 import collections
+import contextlib
 import json
 import os
+import tempfile
 import threading
 from pathlib import Path
 
@@ -78,13 +80,22 @@ def problems(doc) -> list[str]:
 
 
 def write_atomic(path: Path, doc: dict) -> None:
-    """Replace the file in one step, so the runner never reads a half-written one if it stops us mid-write."""
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(doc, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    """Replace the file in one step, so the runner never reads a half-written one if it stops us mid-write.
+
+    The temporary file is this writer's own: with one fixed name, two runs in the same directory replaced each
+    other's temp file and the slower one died on FileNotFoundError. Same directory, so the replace stays atomic."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            os.chmod(tmp, 0o644)  # mkstemp makes it 0600; the file the runner reads stays readable as before
+            json.dump(doc, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 class ResultsBook:
