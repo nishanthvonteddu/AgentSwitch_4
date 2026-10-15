@@ -36,6 +36,9 @@ class MemoryRest:
             page["total"] = len(self.rows)
         return page
 
+    def list(self, entity, **params):
+        return []  # no rows of any entity were written during the run
+
 
 def at(minutes_after_start: float) -> str:
     return (dt.datetime.fromisoformat(STARTED) + dt.timedelta(minutes=minutes_after_start)).isoformat()
@@ -80,8 +83,9 @@ def test_a_malformed_row_naming_this_run_raises_rather_than_reading_as_no_findin
 
 def test_one_malformed_row_no_longer_makes_every_verifier_unevaluated(tmp_path):
     rows = [{"id": "bad", "created_at": at(5), "content": config.FINDING_PREFIX + "{"},
-            finding_row("mine", "run-1", at(3))]
+            finding_row("mine", "run-1", at(3), not_visible=["SalarySlip"])]
     ctx = ctx_for(tmp_path, MemoryRest(rows))
+    ctx.seat_tool_names = lambda: set()  # the seat catalogue holds no SalarySlip tool
     verdict, reason = persist_then_verify(tmp_path, {"run_id": "run-1"}, lambda: team04.refuse_payroll_question(ctx))
     assert verdict is Verdict.APPROVE, reason
 
