@@ -9,6 +9,6 @@
   "params": {},
   "prompt": "Where is the shop floor stuck right now? Group it by the kind of blockage and name the records.",
   "verifier": "harness.verifiers.team04:bottleneck_lanes_reported",
-  "checks": "Cites at least one real blocked record (a rejected QualityInspection or an incomplete SubcontractOrder on an open work order), computed from the database independently of the cockpit. Two of the cockpit's four lanes (shortages, automation_failures) return permission_denied for this seat, so a lane it could not read must not be reported as clear.",
+  "checks": "Answered or partial. Cites at least one real blocked record, computed from the database independently of the cockpit: a rejected QualityInspection whose reference_id is an open work order, or a SubcontractOrder not completed or cancelled on an open work order. No cited QI-/SCO- number may be one that does not exist. Every lane the cockpit reported it could not fill (lane_states, e.g. shortages and automation_failures are permission_denied for this seat) must be named in not_visible: the finding has no per-lane field, so that is how 'not reported as clear' is graded. lane_states exist only in the cockpit's response, so they are read from the run's own shop_floor_exceptions call in the trace; a run that never read them is a revise. Not graded: that every lane is covered, since the tool shows three examples per lane chosen by the cockpit. Subject and outcome rules: harness/verifiers/team04.py docstring.",
   "fixture": null
 }

@@ -10,6 +10,6 @@
   },
   "prompt": "What did WO-2026-00028 cost against plan? Give me the variance and the currency.",
   "verifier": "harness.verifiers.team04:cost_variance_from_db",
-  "checks": "Variance = actual_cost - expected_cost from DB; currency = Company.default_currency (INR).",
+  "checks": "About WO-2026-00028, answered or partial. Variance = actual_cost - expected_cost from DB, recorded as numbers in cost; currency = Company.default_currency (INR). A non-numeric variance is a revise. Subject and outcome rules: harness/verifiers/team04.py docstring.",
   "fixture": null
 }

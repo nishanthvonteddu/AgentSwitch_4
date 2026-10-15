@@ -7,5 +7,5 @@
   "params": {"work_order": "WO-2026-00073"},
   "prompt": "WO-2026-00073 is late. What does it block downstream?",
   "verifier": "harness.verifiers.team04:downstream_claims_are_potential",
-  "checks": "Every open order whose BOM uses this order's item is reported as a potential consumer, none is invented, and nothing is recorded as a confirmed block."
+  "checks": "About WO-2026-00073, answered or partial. Every open order whose BOM uses this order's item is reported as a potential consumer, none is invented, and nothing is recorded as a confirmed block (a non-empty blocked_work_orders, a key outside the schema; an empty one claims nothing). Subject and outcome rules: harness/verifiers/team04.py docstring."
 }

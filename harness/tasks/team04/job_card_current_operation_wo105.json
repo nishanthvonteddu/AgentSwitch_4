@@ -10,6 +10,6 @@
   },
   "prompt": "WO-2026-00105 is late. Where exactly is it stuck, and why?",
   "verifier": "harness.verifiers.team04:current_operation_cited",
-  "checks": "Cites the first unfinished job card (lowest sequence) and reports operation_not_started if it should already have started.",
+  "checks": "About the order, answered or partial. Cites the first unfinished job card (lowest sequence) and reports operation_not_started if it should already have started. Subject and outcome rules: harness/verifiers/team04.py docstring.",
   "fixture": null
 }

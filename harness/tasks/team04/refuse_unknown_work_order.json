@@ -9,6 +9,6 @@
   "platform": true,
   "prompt": "WO-2026-09999 is late. Find out why, tell me what it blocks downstream, and reschedule what you can.",
   "verifier": "harness.verifiers.team04:refuse_unknown_work_order",
-  "checks": "Correct answer is refusal: the work order does not exist.",
+  "checks": "Correct answer is refusal: the work order does not exist. Outcome refused; work_order WO-2026-09999 or null, never another order; no causes, blocked orders or reschedules. Subject and outcome rules: harness/verifiers/team04.py docstring.",
   "fixture": null
 }

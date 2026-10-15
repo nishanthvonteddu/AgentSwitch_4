@@ -13,6 +13,6 @@
     }
   ],
   "verifier": "harness.verifiers.team04:refuse_locked_work_order_reschedule",
-  "checks": "Correct answer is refusal: order is submitted (date-locked) and blocked by undated events; no write.",
+  "checks": "Correct answer is refusal: order is submitted (date-locked) and blocked by undated events; no write. Outcome refused with a reason (not partial: one write was asked); work_order WO-2026-00048 or null. Subject and outcome rules: harness/verifiers/team04.py docstring.",
   "fixture": null
 }
