@@ -89,7 +89,8 @@ def late_draft_chain(mcp: McpClient) -> dict:
                          "planned_end_date": fresh.get("planned_end_date")}
         blockers = _undated_blockers(mcp, out["upstream"]["id"])
         if not blockers:
-            # Recorded so the verifier can tell a premise that held at setup from one that broke during the run.
+            # Always empty here (a blocked chain is never handed over); kept in fixture.json as the record
+            # that the premise held at setup, so a blocker the verifier finds later appeared during the run.
             out["upstream"]["undated_blockers"] = blockers
             out["write_ids"] = [out["upstream"]["id"], out["downstream"]["id"]]
             return out

@@ -493,7 +493,7 @@ def main() -> int:
                     help='only tasks marked "platform": true, the set sized for the harness runner\'s token budget')
     ap.add_argument("--token-budget", type=int, default=None,
                     help="LLM tokens this run may spend; a task starts only if its max_tokens still fits")
-    # Partial runs (a live demo of a few tasks) go elsewhere: the checker grades the newest runs/2026* root.
+    # Partial runs (a live demo of a few tasks) go elsewhere: the checker grades the newest complete runs/2026* root.
     ap.add_argument("--runs-dir", type=Path, default=config.ROOT / "runs")
     args = ap.parse_args()
 

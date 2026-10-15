@@ -147,8 +147,16 @@ def _tool_calls(ctx: VerifyContext) -> list[dict]:
         return []
 
 
+def _ran(call: dict) -> bool:
+    """The call reached its tool and returned. The loop turns a raised call (bad arguments, an MCP error, a tool
+    bug) into {"error": ...} and marks the trace event's own error; the repeat guard answers {"repeat": true}
+    without running anything. Neither is evidence of what the tool would have returned."""
+    result = call.get("result")
+    return not call.get("error") and isinstance(result, dict) and not result.get("repeat")
+
+
 def _results(ctx: VerifyContext, name: str) -> list[dict]:
-    return [c["result"] for c in _tool_calls(ctx) if c.get("name") == name and isinstance(c.get("result"), dict)]
+    return [c["result"] for c in _tool_calls(ctx) if c.get("name") == name and _ran(c)]
 
 
 def _arguments(call: dict) -> dict:
@@ -726,12 +734,10 @@ def _run_found_no_committable_date(ctx: VerifyContext, number: str) -> str | Non
 def _upstream_premise(ctx: VerifyContext, up: dict) -> str | None:
     """Why the fixture upstream has no committable date, if it has none: the write tasks assume it does.
 
-    In order of independence: what the fixture recorded at setup, what REST shows now, and, last, what the
+    The fixture already refuses to hand over an upstream with an undated blocker (harness/fixtures.py), so what
+    is checked here is whether one appeared during the run: first what REST shows now, then, last, what the
     run's own propose_reschedule reported. The last is not independent of the agent's code, so it is only ever
     used to say unevaluated (never a pass), and the reason says so."""
-    recorded = (ctx.fixture.get("upstream") or {}).get("undated_blockers")
-    if recorded:
-        return f"premise gone: the fixture recorded undated blockers on {up['number']} at setup: {recorded}"
     if found := _undated_blockers(ctx, up):
         return f"premise gone: {up['number']} carries undated blockers in the DB, so no date is committable: {found}"
     if seen := _run_found_no_committable_date(ctx, up["number"]):
@@ -1130,7 +1136,14 @@ _POLICY_ENTITIES = {"AgentToolPolicy", "AgentPersona", "AgentSeat"}
 def _read_declared_policy(ctx: VerifyContext) -> bool:
     """The run read the declared policy: seat_policy_conformance, or the policy rows through a generic read."""
     for call in _tool_calls(ctx):
-        if call.get("name") == "seat_policy_conformance" and isinstance(call.get("result"), dict):
+        if not _ran(call):
+            continue
+        result = call["result"]
+        # A tool that ran but could not reach the rows (available false, or a read error it reports itself)
+        # did not read the policy either.
+        if result.get("error") or result.get("available") is False:
+            continue
+        if call.get("name") == "seat_policy_conformance":
             return True
         if call.get("name") in ("query_records", "query_group") and _arguments(call).get("entity") in _POLICY_ENTITIES:
             return True

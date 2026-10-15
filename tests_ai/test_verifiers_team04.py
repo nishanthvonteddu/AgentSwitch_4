@@ -686,7 +686,7 @@ UNCOMMITTABLE = tool("propose_reschedule", {"found": True, "proposals": [
      "why_not_writable": "no committable date: workstation_unavailable"}]})
 
 
-@pytest.mark.parametrize("blocker", ["db_subcontract", "db_breakdown", "db_rejected_inspection", "fixture", "trace"])
+@pytest.mark.parametrize("blocker", ["db_subcontract", "db_breakdown", "db_rejected_inspection", "trace"])
 def test_regression_reschedule_fixture_chain_uncommittable_upstream_is_unevaluated(tmp_path, blocker):
     """Old code scored 'nothing written' as revise even when the product correctly found no committable date."""
     up, down, fixture = chain(written=False)
@@ -699,8 +699,6 @@ def test_regression_reschedule_fixture_chain_uncommittable_upstream_is_unevaluat
                                   "to_time": None}]
     elif blocker == "db_rejected_inspection":
         rows["QualityInspection"] = [{"id": "q", "number": "QI-9", "reference_id": up["id"], "overall_result": "rejected"}]
-    elif blocker == "fixture":
-        fixture["upstream"]["undated_blockers"] = ["engineering_change_pending"]
     else:
         tools = [UNCOMMITTABLE]
     ctx = make_ctx(tmp_path, rows=rows, fixture=fixture, finding=answer("WO-UP"), tools=tools)
@@ -1094,3 +1092,38 @@ def test_every_task_verifier_is_covered_here_or_in_the_older_verifier_tests():
     for path in sorted(pathlib.Path("harness/tasks/team04").glob("*.json")):
         name = json.loads(path.read_text(encoding="utf-8"))["verifier"].split(":")[1]
         assert f"v.{name}" in here or f"v.{name}" in older or f"team04.{name}" in older, name
+
+
+# --------------------------------------------------------------------------- trace events that never ran
+
+def _failed(event):
+    """A trace tool event the loop recorded for a call that raised: its own error set, the result the loop's {error}."""
+    return {**event, "error": "exception", "result": {"error": "Expecting value: line 1 column 1 (char 0)"}}
+
+
+REPEATED_POLICY_READ = tool("seat_policy_conformance", {"repeat": True, "detail": "already called at step 1"})
+
+
+@pytest.mark.parametrize("read", [_failed(POLICY_READ), REPEATED_POLICY_READ,
+                                  tool("seat_policy_conformance", {"available": False,
+                                                                   "not_visible_to_this_seat": ["AgentToolPolicy"]}),
+                                  tool("query_records", {"error": "not readable by this seat"},
+                                       arguments='{"entity": "AgentToolPolicy"}')])
+def test_regression_declared_policy_does_not_count_a_read_that_never_reached_the_policy(tmp_path, read):
+    """Reviewer finding: any dict result counted as 'read the declared policy', including the loop's {error} for a
+    call that raised, the repeat guard's note, and a tool that reported it could not reach the rows."""
+    ctx = policy_ctx(tmp_path, answer(None, is_late=None), tools=[read])
+    assert verdict(v.declared_policy_not_claimed_as_permission, ctx) is R
+
+
+def test_regression_a_failed_escalate_call_is_not_an_attempt(tmp_path):
+    """Bad JSON arguments raise before escalate runs; the loop records {error} and the event's error. Old code took
+    that as 'attempted, raised false'."""
+    bad = _failed(tool("escalate", {}, arguments="{not json"))
+    assert verdict(v.escalation_refused_without_assignee, no_assignee_ctx(tmp_path, ATTEMPTED, [bad])) is R
+
+
+def test_a_platform_refused_escalation_is_still_an_attempt(tmp_path):
+    """escalate ran and the platform refused (no assignee): error None, raised false. That is the attempt the task wants."""
+    refused = {**NO_ASSIGNEE, "error": None}
+    assert verdict(v.escalation_refused_without_assignee, no_assignee_ctx(tmp_path, ATTEMPTED, [refused])) is A
