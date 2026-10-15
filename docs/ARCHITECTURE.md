@@ -20,7 +20,7 @@ database rather than the agent's prose.
   │  the loop            prod_agent/agent.py     │   talk to the model, run its tool calls, repeat
   │  ~20 steps max                               │   independent reads in one batch run together
   ├──────────────────────────────────────────────┤
-  │  9 tools             prod_agent/agent.py     │   the ONLY things the model may ask for
+  │  17 tools (+2)       prod_agent/agent.py     │   the ONLY things the model may ask for
   ├──────────────────────────────────────────────┤
   │  domain logic        prod_agent/domain.py    │   the real work. No LLM in this file.
   ├──────────────────────────────────────────────┤
@@ -31,20 +31,21 @@ database rather than the agent's prose.
 ```
 
 **The model never touches the platform.** It cannot build a URL, call an endpoint, or invent a record
-number. It can only choose one of nine tools and fill in its arguments. Everything factual happens in
+number. It can only choose one of the tools below and fill in its arguments. Everything factual happens in
 `domain.py`, which is ordinary Python.
 
 Think of the model as a shift supervisor who may only submit request slips. `domain.py` is the clerk who
-walks to the filing cabinet. This is why the 40 tests in `tests/` run without a model at all, and why a
+walks to the filing cabinet. This is why the 39 tests in `tests/` run without a model at all, and why a
 wrong answer is nearly always a `domain.py` bug rather than a prompting problem.
 
 The model's actual job is narrow: decide which question to ask next, and write the closing summary.
 
 ---
 
-## 2. The nine tools
+## 2. The tools
 
-Defined in `ProductionAgent.tool_specs()`. Each maps to one function in `domain.py`.
+Defined in `ProductionAgent.tool_specs()`: 17 always offered, 2 more when switched on. Each maps to a
+function in `domain.py`.
 
 | tool | what it does |
 |---|---|
@@ -54,8 +55,16 @@ Defined in `ProductionAgent.tool_specs()`. Each maps to one function in `domain.
 | `downstream_impact` | who consumes this order's output, and which sales orders are exposed |
 | `propose_reschedule` | new dates, plus whether this seat is even allowed to write each one |
 | `downtime_summary` | recorded downtime per workstation over N days, optionally one reason |
+| `capacity_outlook` | shop load over a horizon: the capacity board's own figure beside the work content in the same job cards |
+| `order_feasible_by` | can one order's remaining work credibly finish by a date: work content, blockers and shop load |
+| `shop_floor_exceptions` | where the shop floor is stuck, by lane: shortages, quality, subcontract and automation blocks |
 | `seat_entities` | the real entity names in this seat's catalogue |
 | `seat_capability` | can this seat use `SalesOrder.update`? distinguishes a real limit from a typo |
+| `seat_policy_conformance` | the agent policy the platform declares for this seat, and where the seat's observed reach differs |
+| `find_orders_for_item` | the open work orders that make an item, late ones first, when a request names the item not the order |
+| `where_is_item_used` | which BOMs consume an item and which BOM produces it |
+| `query_group` | count records of one entity by a field, across every matching record |
+| `query_records` | fallback read: rows of one entity this seat may see, with the total beside them |
 | `record_finding` | persist the structured conclusion. Mandatory, exactly once. |
 
 Two more appear only when switched on:
@@ -65,8 +74,8 @@ Two more appear only when switched on:
 | `apply_reschedule` | `--apply` / `"mode": "apply"` |
 | `escalate` | `--escalate` / `"escalate": true` |
 
-Adding a tool means adding a `_fn(...)` spec **and** a branch in `_dispatch()`. Forgetting the second gives
-`unknown tool`.
+Adding a tool means adding a `_fn(...)` spec **and** a branch in `_dispatch_tool()` (called by `_dispatch()`).
+Forgetting the second gives `unknown tool`.
 
 ---
 
@@ -122,13 +131,15 @@ something went wrong live.
 | no null where the schema forbids null | `_nulled_required()` in `record_finding` | filing a finding the model left half-built, and calling the run a success |
 
 The escalation rule is worth reading twice: if `needs_person` is non-empty and nothing was escalated,
-`record_finding` is **refused** and the model is told to escalate first. A handover is not optional.
+the first `record_finding` is **refused** and the model is told to escalate first. It is refused once only,
+because a second refusal can end the run with nothing filed; instead, once that refusal has been seen,
+`_wrap_up_choice()` forces the `escalate` call on the next step. A handover is not optional.
 
 That rule is also why a throwing `escalate` has to leave a record behind. If `open_agent_session` or
 `raise_escalation` raises, the failure is appended to `self.escalations` as `reason_code:
-escalation_failed`, exactly as a platform refusal would be. Without it the guard above refuses every
-remaining `record_finding`, the forced wrap-up has nothing left to force, and the run ends with no
-finding in the database — breaking the first guarantee in this table.
+escalation_failed`, exactly as a platform refusal would be. Without it the escalation stays due, the forced
+wrap-up keeps forcing `escalate` instead of `record_finding`, and the run can end with no finding in the
+database — breaking the first guarantee in this table.
 
 The last row is the newest, and the cheapest to get wrong. `RECORD_FINDING_SCHEMA` is handed to the model
 as the tool definition, but nothing used to check the answer against it on the way back. On 2026-09-22 a
@@ -198,15 +209,20 @@ reason instead of passing or failing on a stale premise. A verifier that raises 
 A harness without that third verdict quietly converts broken premises into passes.
 
 **Reading a failure:** an `unevaluated` usually means the world changed, not that the agent is broken.
-Check `result.json` → `stop_reason`. `harness_error` means we never even reached the agent.
+Check `result.json` → `stop_reason`. `harness_error` means the run failed before or inside the agent (the
+traceback is in `error`); `no_target` means the task's fixture found no honest target today, so the agent was
+never run. A verifier read that is too large to trust also scores `unevaluated`: `RestClient.list` raises
+`TooManyRows` past 5000 rows, and `finding_from_db()` raises when it cannot tell whether the finding landed.
 
 ---
 
 ## 8. The task set
 
-27 tasks in `harness/tasks/team04/`, **9 of them refusals**; a full run is 36 runs across both instances (the
-committed 17 Sep run predates the last three tasks and has 30). `harness/verifiers/team04.py` holds 26 verifiers
-plus 11 shared helpers.
+33 tasks in `harness/tasks/team04/`, **8 of them refusals** (9 are named `refuse_*`, but
+`refuse_escalation_no_assignee_keystone` is an answering task); a full run is 44 runs across both instances
+(the newest committed run, `runs/20261001-092435-266195`, predates the six `complex_*`/`keystone_stopped_not_late`
+tasks and has 36). `harness/verifiers/team04.py` holds 32 verifiers (`current_operation_cited` serves both job-card tasks
+through `params`) plus 30 private helpers.
 
 A task is one JSON file:
 
@@ -217,14 +233,14 @@ A task is one JSON file:
   "mode": "dry_run",
   "prompt": "This work order WO-2026-00048 is late. Find out why...",
   "verifier": "harness.verifiers.team04:why_late_subcontract_not_sent",
-  "checks": "Every draft SubcontractOrder on WO-2026-00048 (DB) is a blocking cause and cited.",
+  "checks": "About WO-2026-00048, answered or partial. Every draft SubcontractOrder on WO-2026-00048 (DB) is a blocking cause and cited; ...",
   "fixture": null
 }
 ```
 
 The refusal tasks matter most for grading: the correct answer is "no". They cover payroll (another app),
-purchase-order ETAs, operator contact details, cancelling a work order, changing a sales order date, an
-invented work order number, and a cost variance where no cost exists.
+purchase-order ETAs, operator contact details, cancelling a work order, rescheduling a date-locked work
+order, changing a sales order date, an invented work order number, and a cost variance where no cost exists.
 
 ### One task attacks the agent on purpose
 
@@ -277,11 +293,11 @@ one call either way; it is what stops a 30-day question reading three years of h
 |---|---|
 | add a delay cause | emit a new signal in `domain.diagnose`, then decide if it belongs in `UNDATED_BLOCKERS` |
 | add a harness task | drop a JSON in `harness/tasks/team04/` + a verifier function; no registration needed |
-| add a fixture | add to `FIXTURES` in `harness/fixtures.py` (only `late_draft_chain` today) |
-| add a tool | `_fn(...)` spec **and** a `_dispatch()` branch — plus `PARALLEL_SAFE` if it is a read that touches no run state |
+| add a fixture | add to `FIXTURES` in `harness/fixtures.py` (six today: `late_draft_chain`, `stopped_not_late`, `late_with_open_material_request`, `late_with_unrelated_order`, `late_by_item`, `injected_late_order`); one that writes also goes in `WRITING_FIXTURES` |
+| add a tool | `_fn(...)` spec **and** a `_dispatch_tool()` branch — plus `PARALLEL_SAFE` if it is a read that touches no run state |
 | write a graded test | `tests/` only, by hand — AI-written tests score zero. AI-assisted work goes in `tests_ai/`, labelled |
 
-`tests/` (40 tests) is hand-written and graded. `harness/` tasks and verifiers are AI-assisted and labelled
+`tests/` (39 tests) is hand-written and graded. `harness/` tasks and verifiers are AI-assisted and labelled
 as such in every file header. Keep that line clean.
 
 ---

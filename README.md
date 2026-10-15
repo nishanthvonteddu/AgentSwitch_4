@@ -74,7 +74,7 @@ database scores nothing — the verifiers read state, never the reply text.
 
 `harness/adapters.py:run_agent(llm, mcp, ...)` already takes the client as its first argument.
 `harness/runner.py` constructs `ProductionAgent` without `llm`, so it uses the `.env` provider;
-pass `llm=` at [harness/runner.py:159](harness/runner.py#L159) to point a full harness run at
+pass `llm=` at [harness/runner.py:280](harness/runner.py#L280) to point a full harness run at
 your own client.
 
 ### Using the model AgentSwitch already hosts
@@ -110,6 +110,14 @@ python -m harness.runner --include-samples
 Output goes to `runs/<timestamp>/<instance>/<task>/`: `task.json`, `fixture.json`, `trace.jsonl` (written event by event), and `result.json`, all fsync'd **before** the verifier writes `verdict.json`. Verdicts are `approve`, `revise` or `unevaluated`, and unevaluated never counts as a pass. See [harness/tasks/README.md](harness/tasks/README.md) for the task and verifier format.
 
 Every run also keeps `results.json` (git-ignored) current in the format AgentSwitch's harness runner reads, so `python scripts/check_results.py` can check it.
+
+What a run refuses, skips or cleans up:
+
+- **One local run at a time.** A local run holds `runs/.console-run.lock` for its whole length, the same lock the console takes, because verifiers attribute writes by seat and time window and two runs would grade each other's. While another run or the console holds it, the runner prints `not started: ...` and exits 3. A console-started run inherits the console's lock (`HARNESS_RUN_LOCK_FD`). Platform mode takes no lock (its instance copy is private to the submission). On Windows there is no `flock`, so nothing guards it.
+- **Bad arguments (local runs).** An unknown `--task` id is an argparse error before anything is created. A plan with nothing in it (a task on an instance it does not declare, a sample without `--include-samples`) prints why and exits 2.
+- **No honest target.** A task whose fixture finds nothing today is recorded `unevaluated` (`stop_reason: no_target`) without running the agent.
+- **Escalations are always withdrawn.** Whatever ends a task (a verdict, a crash in the agent or the verifier, Ctrl-C), escalations the agent raised are withdrawn afterwards and written to `cleanup.json`, after `verdict.json`. A killed process skips this, and the CLI (`python -m prod_agent --escalate`) never withdraws.
+- **Reads too big to trust.** `RestClient.list` raises `TooManyRows` past 5000 rows, and `ctx.finding_from_db()` raises when it cannot tell whether the finding landed; a verifier that raises scores `unevaluated`, never a pass.
 
 ## Run on AgentSwitch ("Our harness" → Submit for a run)
 
@@ -155,8 +163,8 @@ answer run the `feasible_by_wo48` task. Questions land in `runs/adhoc/` and show
 
 - It starts the same command you would type: `python -m harness.runner --task <id> --instance <name>
   --runs-dir runs/demo`. Every click is a live run against a shared tenant.
-- Demo runs land in `runs/demo/`, never `runs/2026*`, so a partial run cannot become the run
-  `scripts/verify_submission.py` grades.
+- Demo runs land in `runs/demo/`, never `runs/2026*`, which is the only place `scripts/verify_submission.py`
+  looks (it grades the newest run there that covers every task on every instance).
 - One run at a time, only tasks from `harness/tasks/team04/`, no `--apply`/`--escalate` outside what a task
   declares.
 - There is no stop button: a killed run skips the escalation withdrawal. Ctrl-C stops the page, not the run.
@@ -164,11 +172,11 @@ answer run the `feasible_by_wo48` task. Questions land in `runs/adhoc/` and show
 
 **Before the demo**
 
-- One console process only, and no `python -m harness.runner` from a terminal while it runs: the one-run guard
-  lives in the console's memory and shared fixture rows would collide.
-- Never restart the console while a run is in progress. The run keeps going, but the new console forgets it;
-  wait for the log in `runs/demo/` to end.
-- If you refresh the page just as a run finishes, the live view is not re-attached; the run is under **Demo runs** in Past runs.
+- The console and `python -m harness.runner` share one lock file, `runs/.console-run.lock`, so a second run from
+  another console or a terminal is refused while one is in progress (not on Windows, which has no `flock`).
+- Never restart the console while a run is in progress. The run keeps going and still holds the lock, so the new
+  console refuses to start another, but it does not show the running one; wait for the log in `runs/demo/` to end.
+- If you refresh the page just as a run finishes, the live view is not re-attached; the run is under **Demo runs** in the QC log.
 - Check provider, model and date without showing `.env` on screen (`.env` beats exported variables):
   `grep -E '^(LLM_PROVIDER|OPENAI_MODEL|OPENROUTER_MODEL|AGENT_TODAY)=' .env`. The trace's `start` event shows
   the provider and model actually used.
@@ -202,7 +210,7 @@ tenant is down, walk through `runs/20260917-110938` in the same page.
 
 - **Re-reads before writing.** Each proposal carries `updated_at`. If the row changed or its status moved, the write is skipped with `changed_underneath`.
 - **Stops after a conflict.** Once any order changes underneath a run, every further write in that run is refused and the conflict goes to a person. The harness proves this live: `concurrent_edit_before_write` moves a fixture order's dates between the agent's proposal and its write.
-- **Hands work to a person.** With `--escalate` (or `"escalate": true` in a task), a locked, undatable or conflicting order is escalated through the platform's escalation queue to the assignee the platform names. If no assignee exists (Keystone today), the agent says so instead of claiming a handover. `record_finding` is refused until a required escalation has been attempted. Harness-raised escalations are withdrawn after scoring.
+- **Hands work to a person.** With `--escalate` (or `"escalate": true` in a task), a locked, undatable or conflicting order is escalated through the platform's escalation queue to the assignee the platform names. If no assignee exists (Keystone today), the agent says so instead of claiming a handover. The first `record_finding` before a required escalation is refused, and the next step forces the `escalate` call. Harness-raised escalations are withdrawn after scoring.
 - **Potential, not confirmed, downstream.** Orders found by BOM matching are recorded as `potentially_blocked_work_orders` with `confidence: potential`, because stock or another order may cover the demand. A sales order is `linked` only when it is on the late order itself.
 - **Writes only what the seat can write.** Submitted work orders are date-locked for `manufacturing_user` (verified live), so the agent writes dates on drafts only and proposes the rest.
 - **Two gates on writes.** Every write needs approval (a human prompt in the CLI; in the harness, only the team's own fixture rows) and must be in the allowed-id set.
@@ -222,4 +230,4 @@ tenant is down, walk through `runs/20260917-110938` in the same page.
 ## Rows this team created on Suryodaya
 
 - WO-2026-00122: probe for the write-lock test, not_started, cannot be cancelled by our role.
-- WO-2026-00123 and WO-2026-00124: harness fixtures (drafts, reused and reset every run).
+- Harness fixtures: drafts the `late_draft_chain` and `injected_late_order` fixtures own. They are found again each run by the `team04-harness fixture:<name>` marker in their notes, not by number, and only created when none is found, so their numbers are not fixed. Every run resets their dates; `late_draft_chain` also repoints its pair at a BOM chain whose upstream has no undated blocker, trying up to 5 chains.
