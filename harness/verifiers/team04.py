@@ -961,38 +961,30 @@ def _work_content(cards) -> float:
     return sum((c.get("time_in_mins") or 0) * (c.get("for_qty") or 0) for c in cards)
 
 
-def _board_counts(ctx: VerifyContext) -> tuple[float, float] | None:
-    """The capacity board's booked and available minutes, as the platform returned them to this run.
-
-    capacity_board is reachable only as an MCP endpoint, and no REST path for it is used anywhere here, so its
-    response is taken from the trace: capacity_outlook passes the board's counts through unchanged. The load
-    percentages are recomputed below, not taken from the agent's arithmetic."""
-    for result in reversed(_results(ctx, "capacity_outlook")):
-        board = result.get("board_reported")
-        if isinstance(board, dict):
-            booked, available = _number(board.get("booked_minutes")), _number(board.get("available_minutes"))
-            if booked is not None and available:
-                return booked, available
-    return None
+CAPACITY_HORIZON_DAYS = 21  # "the next three weeks" in the task prompt; capacity_outlook's own default too
 
 
 def capacity_load_disputed(ctx: VerifyContext):
-    """The two load figures disagree, and the finding records both, each matching its source.
+    """Both load figures are recorded, each matching its source, and the finding says whether they disagree as the
+    board and the cards do now.
 
-    Work content is recomputed from open job cards at verify time. The board's own figure has no independent
-    read (see _board_counts), so it is checked against the board response this run received, and the work
-    content load is put over that response's available minutes."""
+    The board's figure is the platform's to compute, so it is read from the board itself (ctx.capacity_board, an
+    MCP read like seat_tool_names), never rebuilt from the cards: rebuilt as sum(time_in_mins) it graded the
+    official run of 2026-10-15 revise on both instances, after the platform began scaling by for_qty and the board
+    agreed with the work content to the minute (our report C1 fixed). Work content is recomputed from the open job
+    cards. Both are read at verify time, a little after the run, so each recorded figure is held to a tolerance."""
     cards = [c for c in ctx.rest.list("JobCard") if c.get("status") in OPEN_JOB_CARD]
     if not cards:
         return U, "premise gone: no open job cards on this instance"
     content = _work_content(cards)
-    board = _board_counts(ctx)
-    # Without the board's response the premise is judged on the same cards charged unscaled, which is how the
-    # board understates them (our report C1).
-    booked = board[0] if board else sum(c.get("time_in_mins") or 0 for c in cards)
-    if not booked or content <= booked * 1.5:
-        # If the platform fixes the scaling, the honest answer changes and this task no longer applies.
-        return U, f"premise gone: work content {content:.0f} no longer exceeds booked {booked:.0f} by 1.5x"
+    try:
+        counts = ctx.capacity_board(CAPACITY_HORIZON_DAYS).get("counts") or {}
+    except Exception as e:
+        return U, f"premise gone: the capacity board cannot be read ({e})"
+    booked, available = _number(counts.get("booked_minutes")), _number(counts.get("available_minutes"))
+    if not booked or not available:
+        return U, f"premise gone: the capacity board reports booked={booked}, available={available} minutes"
+    disagree = content > booked * 1.5
     f, problem = _load_finding(ctx)
     if problem:
         return R, problem
@@ -1006,23 +998,35 @@ def capacity_load_disputed(ctx: VerifyContext):
     board_pct, content_pct = _number(capacity.get("board_load_pct")), _number(capacity.get("work_content_load_pct"))
     if board_pct is None or content_pct is None:
         return R, (f"finding carries only one load figure (board={capacity.get('board_load_pct')!r}, "
-                   f"work_content={capacity.get('work_content_load_pct')!r}); both are required because the "
-                   "board's is understated and ours is not the platform's")
-    if capacity.get("figures_disagree") is not True:
-        return R, f"the two figures disagree by {content / booked:.0f}x in the database, but the finding does not say so"
-    if board is None:
-        return R, "the run never read the capacity board, so its recorded board figure has no source"
-    available = board[1]
+                   f"work_content={capacity.get('work_content_load_pct')!r}); both are required: the board's is the "
+                   "platform's figure and the work content is ours")
+    recorded = capacity.get("figures_disagree")
+    if not isinstance(recorded, bool):
+        return R, f"figures_disagree is {recorded!r}, not true or false"
+    ratio = content / booked
+    if recorded != disagree:
+        if disagree:
+            return R, f"the two figures disagree by {ratio:.0f}x in the database, but the finding does not say so"
+        return R, (f"the board's {booked:.0f} booked minutes match the {content:.0f} minutes of work content, "
+                   "but the finding says the figures disagree")
+    # The pair must describe THIS shop, not two numbers of the agent's choosing: their ratio is the DB ratio.
+    reported = content_pct / board_pct if board_pct else None
+    if not reported or abs(reported - ratio) > max(0.25 * ratio, 0.25):
+        gap = f"{reported:.1f}x" if reported else "no"
+        return R, (f"recorded figures imply a {gap} gap but the database shows {ratio:.1f}x "
+                   f"(board {board_pct}%, work content {content_pct}%)")
+    # And each figure against its own source: a pair invented with the right ratio is still wrong.
+    # Booked minutes and open cards both move between the run and this check, hence the tolerance on both.
     want_board, want_content = 100 * booked / available, 100 * content / available
-    # The board figure comes from the same response, so only rounding separates them. Job cards move between
-    # the run and this check, so the work content figure is held to a wider tolerance.
-    if abs(board_pct - want_board) > max(0.05, 0.05 * want_board):
-        return R, f"recorded board load {board_pct}%; the board returned {booked:.0f} of {available:.0f} min = {want_board:.2f}%"
+    if abs(board_pct - want_board) > max(1.0, 0.1 * want_board):
+        return R, f"recorded board load {board_pct}%; the board reports {booked:.0f} of {available:.0f} min = {want_board:.2f}%"
     if abs(content_pct - want_content) > max(1.0, 0.1 * want_content):
         return R, (f"recorded work-content load {content_pct}%; open job cards hold {content:.0f} min over "
                    f"{available:.0f} available = {want_content:.1f}%")
-    return A, (f"recorded both figures ({board_pct}% board vs {content_pct}% work content), each matching its "
-               f"source, and flagged the {content / booked:.0f}x disagreement")
+    if disagree:
+        return A, (f"recorded both figures ({board_pct}% board vs {content_pct}% work content), each matching its "
+                   f"source, and flagged the {ratio:.0f}x disagreement")
+    return A, f"recorded both figures ({board_pct}% board, {content_pct}% work content) and that they agree"
 
 
 def feasibility_verdict_from_db(ctx: VerifyContext):

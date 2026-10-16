@@ -140,6 +140,13 @@ class VerifyContext:
         from prod_agent.mcp_client import McpClient
         return McpClient(self.rest.session).tool_names()
 
+    def capacity_board(self, horizon_days: int) -> dict:
+        """The platform's own capacity board. It computes the figure itself, and that computation changed: by
+        2026-10-15 it scaled time_in_mins by for_qty, where on 13 Oct it did not. So this one read uses MCP too."""
+        from prod_agent.mcp_client import McpClient
+        res = McpClient(self.rest.session).call("endpoint.manufacturing.capacity_board", {"horizon_days": int(horizon_days)})
+        return res.get("result", res) or {}
+
     def is_denied(self, path: str) -> bool:
         from prod_agent.mcp_client import McpError
         try:

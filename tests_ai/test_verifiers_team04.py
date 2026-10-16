@@ -17,6 +17,7 @@ import pytest
 from harness.verifiers import team04 as v
 from harness.verify import Verdict, VerifyContext
 from prod_agent import config
+from prod_agent.mcp_client import McpError
 
 A, R, U = Verdict.APPROVE, Verdict.REVISE, Verdict.UNEVALUATED
 TODAY = dt.date(2026, 10, 1)
@@ -884,9 +885,14 @@ def test_regression_concurrent_edit_preserved_blocked_upstream_is_unevaluated(tm
 def capacity_ctx(tmp_path, finding, *, board=(100.0, 10000.0), qty=20):
     # Two open cards of 50 min per piece: 100 min charged unscaled, 2000 min of work content.
     cards = [{"id": f"c{i}", "status": "open", "time_in_mins": 50, "for_qty": qty} for i in range(2)]
-    tools = [] if board is None else [tool("capacity_outlook", {
-        "board_reported": {"booked_minutes": board[0], "available_minutes": board[1]}})]
-    return make_ctx(tmp_path, rows={"JobCard": cards}, finding=finding, tools=tools)
+    ctx = make_ctx(tmp_path, rows={"JobCard": cards}, finding=finding, tools=[])
+
+    def capacity_board(horizon_days):  # the board read at verify time, as VerifyContext.capacity_board does
+        if board is None:
+            raise McpError(-32001, "capacity board unavailable")
+        return {"counts": {"booked_minutes": board[0], "available_minutes": board[1]}}
+    ctx.capacity_board = capacity_board
+    return ctx
 
 
 def loads(board_pct, content_pct, disagree=True):
@@ -915,13 +921,20 @@ def test_capacity_load_disputed_revises_missing_or_unflagged_figures(tmp_path, f
     assert verdict(v.capacity_load_disputed, capacity_ctx(tmp_path, finding)) is R
 
 
-def test_capacity_load_disputed_revises_a_board_figure_the_run_never_read(tmp_path):
-    assert verdict(v.capacity_load_disputed, capacity_ctx(tmp_path, loads(1.0, 20.0), board=None)) is R
+def test_capacity_load_disputed_an_unreadable_board_is_unevaluated(tmp_path):
+    assert verdict(v.capacity_load_disputed, capacity_ctx(tmp_path, loads(1.0, 20.0), board=None)) is U
 
 
-def test_capacity_load_disputed_when_the_figures_agree_is_unevaluated(tmp_path):
-    ctx = capacity_ctx(tmp_path, loads(1.0, 1.0), qty=1)
-    assert verdict(v.capacity_load_disputed, ctx) is U
+def test_capacity_load_disputed_grades_figures_that_agree(tmp_path):
+    """Since 2026-10-15 the board scales by for_qty and agrees with the work content: recording that they agree
+    is the right answer, and claiming they disagree is not."""
+    assert verdict(v.capacity_load_disputed, capacity_ctx(tmp_path, loads(1.0, 1.0, disagree=False), qty=1)) is A
+    assert verdict(v.capacity_load_disputed, capacity_ctx(tmp_path, loads(1.0, 1.0, disagree=True), qty=1)) is R
+
+
+def test_capacity_load_disputed_revises_an_agreeing_pair_with_the_wrong_magnitude(tmp_path):
+    """Right ratio (1:1), wrong load: 5% vs 5% where the board and the cards both say 1%."""
+    assert verdict(v.capacity_load_disputed, capacity_ctx(tmp_path, loads(5.0, 5.0, disagree=False), qty=1)) is R
 
 
 # --------------------------------------------------------------------------- bottleneck_lanes_reported
