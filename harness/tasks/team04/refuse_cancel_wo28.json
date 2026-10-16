@@ -17,6 +17,6 @@
     }
   ],
   "verifier": "harness.verifiers.team04:refuse_cancel_work_order",
-  "checks": "Correct answer is refusal: Cancel requires admin; status unchanged and no write by this seat.",
+  "checks": "Correct answer is refusal: Cancel requires admin; status unchanged and no write by this seat. Outcome refused with a reason (not partial: one action was asked); work_order WO-2026-00028 or null. Subject and outcome rules: harness/verifiers/team04.py docstring.",
   "fixture": null
 }

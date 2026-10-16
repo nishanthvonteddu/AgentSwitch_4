@@ -9,6 +9,6 @@
   "max_seconds": 300,
   "prompt": "Find the most overdue open work order. Find out why it is late, tell me what it blocks downstream, and reschedule what you can.",
   "verifier": "harness.verifiers.team04:most_overdue_open",
-  "checks": "Picks the open WO with the earliest past-due planned_end_date in DB; causes match DB; no writes.",
+  "checks": "Picks the open WO with the earliest past-due planned_end_date in DB (matched without regard to case); answered or partial; causes match DB; no writes. Subject and outcome rules: harness/verifiers/team04.py docstring.",
   "fixture": null
 }

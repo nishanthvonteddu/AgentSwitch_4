@@ -7,55 +7,116 @@ reader of that record would think the request had been carried out.
 
 propose_reschedule already returns the platform's own why_not_writable, so the refusal and its
 reason are both facts the loop holds before the model is asked for them.
+
+These go through ProductionAgent._dispatch over an in-memory book (test_behaviour_fakes.Book): the proposal
+comes from the real propose_reschedule, and the outcome is read from what reached AgentMemory.
 """
-from prod_agent.agent import ProductionAgent
+import pytest
+from test_behaviour_fakes import Book, agent_on, finding, pin_today, work_order
 
 
-def _agent(proposals, applied=None, apply_mode=True) -> ProductionAgent:
-    agent = ProductionAgent.__new__(ProductionAgent)
-    agent.apply_mode = apply_mode
-    agent._proposals = proposals
-    agent._applied = applied or {}
-    agent._refusal_warned = False
-    return agent
+@pytest.fixture(autouse=True)
+def pinned(monkeypatch):
+    pin_today(monkeypatch)
 
 
-def _fires(agent, outcome) -> bool:
-    """Mirror of the guard's condition in record_finding."""
-    return bool(agent.apply_mode and agent._proposals and not agent._applied
-                and not any(p.get("writable_by_seat") for p in agent._proposals.values())
-                and outcome not in (None, "refused") and not agent._refusal_warned)
+B = "id-WO-2026-00170"
 
 
-LOCKED = {"wo-48": {"number": "WO-2026-00048", "writable_by_seat": False,
-                    "why_not_writable": "no committable date: engineering_change_pending"}}
-WRITABLE = {"wo-48": {"number": "WO-2026-00048", "writable_by_seat": True}}
+def _locked():
+    """WO-2026-00048: draft, with a subcontract never sent, so no date can be committed."""
+    wo = work_order("WO-2026-00048", "draft", start="2026-08-01", end="2026-08-20")
+    return Book(tables={"WorkOrder": [wo], "SubcontractOrder": [
+        {"id": "sco-30", "number": "SCO-2026-00030", "work_order_id": wo["id"], "status": "draft",
+         "expected_delivery_date": None, "vendor_id": "v-1"}]})
+
+
+def _chain():
+    """WO-169 (draft, unblocked) and WO-170 (draft, consumes WO-169's item): both writable."""
+    return Book(tables={
+        "WorkOrder": [work_order("WO-2026-00169", "draft", start="2026-09-01", end="2026-09-05"),
+                      work_order("WO-2026-00170", "draft", start="2026-09-10", end="2026-09-13", bom_id="bom-170")],
+        "BOM": [{"id": "bom-170", "number": "BOM-170", "materials": [{"item_id": "item-WO-2026-00169", "qty": 2}]}]})
 
 
 def test_the_live_failure_is_caught():
-    assert _fires(_agent(LOCKED), "answered")
+    """Nothing written, filed as answered with no refusal_reason: sent back, and nothing stored."""
+    book = _locked()
+    agent = agent_on(book, apply_mode=True, approve=lambda p: True)
+    proposed = agent._dispatch("propose_reschedule", {"work_order": "WO-2026-00048"})
+    assert [p["writable_by_seat"] for p in proposed["proposals"]] == [False]
+
+    out = agent._dispatch("record_finding", finding("WO-2026-00048", blocking_causes=["subcontract_not_sent"]))
+
+    assert out["error"] == "nothing could be written and the finding does not say so"
+    assert out["why_not_writable"] == ["no committable date: subcontract_not_sent"]
+    assert book.memories == [] and agent.finding is None
+
+
+def test_the_retry_does_not_inherit_the_blamed_outcome():
+    """The refusal blames outcome and refusal_reason, so the retry's own values are the ones stored."""
+    book = _locked()
+    agent = agent_on(book, apply_mode=True, approve=lambda p: True)
+    agent._dispatch("propose_reschedule", {"work_order": "WO-2026-00048"})
+    agent._dispatch("record_finding", finding("WO-2026-00048", evidence_records=["SCO-2026-00030"]))
+
+    retry = finding("WO-2026-00048", outcome="refused", refusal_reason="no committable date: subcontract_not_sent")
+    del retry["evidence_records"]
+    agent._dispatch("record_finding", retry)
+
+    [stored] = book.recorded_findings()
+    assert stored["outcome"] == "refused" and stored["refusal_reason"].startswith("no committable date")
+    assert "SCO-2026-00030" in stored["evidence_records"]
 
 
 def test_a_correct_refusal_passes():
-    assert not _fires(_agent(LOCKED), "refused")
+    book = _locked()
+    agent = agent_on(book, apply_mode=True, approve=lambda p: True)
+    agent._dispatch("propose_reschedule", {"work_order": "WO-2026-00048"})
+    out = agent._dispatch("record_finding", finding("WO-2026-00048", outcome="refused",
+                                                    refusal_reason="no committable date: subcontract_not_sent"))
+    assert "agent_memory_id" in out
+    assert book.recorded_findings()[0]["outcome"] == "refused"
 
 
 def test_a_run_that_wrote_something_is_left_alone():
-    agent = _agent(LOCKED, applied={"wo-49": {"number": "WO-2026-00049", "outcome": "applied"}})
-    assert not _fires(agent, "answered")
+    """WO-170 was proposed on its own and written; proposing WO-48 then marks WO-170 a dependant it cannot
+    date. Every proposal held is now unwritable, but the run did write, so answering is right."""
+    book = _locked()
+    book.tables["WorkOrder"].append(work_order("WO-2026-00170", "draft", start="2026-08-25", end="2026-08-28",
+                                               bom_id="bom-170"))
+    book.tables["BOM"] = [{"id": "bom-170", "number": "BOM-170", "materials": [{"item_id": "item-WO-2026-00048"}]}]
+    agent = agent_on(book, apply_mode=True, approve=lambda p: True)
+    agent._dispatch("propose_reschedule", {"work_order": "WO-2026-00170"})
+    assert agent._dispatch("apply_reschedule", {"work_order_id": B})["outcome"] == "applied"
+    agent._dispatch("propose_reschedule", {"work_order": "WO-2026-00048"})
+    assert not any(p["writable_by_seat"] for p in agent._proposals.values())
+
+    out = agent._dispatch("record_finding", finding("WO-2026-00048"))
+
+    assert "agent_memory_id" in out
+    assert book.recorded_findings()[0]["rescheduled"][0]["outcome"] == "applied"
 
 
 def test_a_writable_proposal_is_not_a_refusal():
-    assert not _fires(_agent(WRITABLE), "answered")
+    book = _chain()
+    agent = agent_on(book, apply_mode=True, approve=lambda p: True, allowed_write_ids=set())
+    agent._dispatch("propose_reschedule", {"work_order": "WO-2026-00169"})
+    assert "agent_memory_id" in agent._dispatch("record_finding", finding("WO-2026-00169"))
 
 
 def test_a_read_only_run_is_not_second_guessed():
     """Nothing was asked to be written, so answering is the right outcome."""
-    assert not _fires(_agent(LOCKED, apply_mode=False), "answered")
+    book = _locked()
+    agent = agent_on(book)
+    agent._dispatch("propose_reschedule", {"work_order": "WO-2026-00048"})
+    assert "agent_memory_id" in agent._dispatch("record_finding", finding("WO-2026-00048"))
 
 
 def test_it_warns_once_and_then_lets_the_finding_through():
-    agent = _agent(LOCKED)
-    assert _fires(agent, "answered")
-    agent._refusal_warned = True
-    assert not _fires(agent, "answered")
+    book = _locked()
+    agent = agent_on(book, apply_mode=True, approve=lambda p: True)
+    agent._dispatch("propose_reschedule", {"work_order": "WO-2026-00048"})
+    assert "error" in agent._dispatch("record_finding", finding("WO-2026-00048"))
+    assert "agent_memory_id" in agent._dispatch("record_finding", finding("WO-2026-00048"))
+    assert [f["outcome"] for f in book.recorded_findings()] == ["answered"]

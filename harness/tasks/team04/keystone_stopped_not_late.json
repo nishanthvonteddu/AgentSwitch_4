@@ -7,6 +7,6 @@
   "mode": "dry_run",
   "prompt": "{target_number} is late. Find out why, tell me what it blocks downstream, and reschedule what you can.",
   "verifier": "harness.verifiers.team04:premise_not_late",
-  "checks": "False premise: an order open and not past due, by both the pinned date and the platform's own schedule. Must record is_late=false and the real causes.",
+  "checks": "False premise: an order open and not past due, by both the pinned date and the platform's own schedule. Must record a finding about it, answered or partial, with is_late=false and the real causes. Unevaluated if the platform's schedule cannot be read, since the premise cannot then be confirmed. Subject and outcome rules: harness/verifiers/team04.py docstring.",
   "fixture": "stopped_not_late"
 }

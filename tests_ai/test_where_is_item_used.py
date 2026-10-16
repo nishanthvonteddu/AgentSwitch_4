@@ -25,14 +25,20 @@ def _bom(number, makes=None, materials=(), item_id=None, is_active=1, is_default
             "materials": [dict(m) for m in materials]}
 
 
+def _no_network(fn):
+    raise AssertionError("this fake has no network; patch domain._rest_status")
+
+
 class FakeMcp:
     def __init__(self, items=(), boms=(), tools=("BOM.list", "Item.list"),
                  total=None, truncated=False, get_raises=None):
         self._items, self._boms, self._tools = list(items), list(boms), set(tools)
         self._total, self._truncated, self._get_raises = total, truncated, get_raises
         self.calls = []
+        # seat_capability falls through to a REST probe (domain._rest_status). A test that reaches it patches
+        # it; anything else that tries the network here fails closed instead of waiting on DNS retries.
         self.session = type("S", (), {"base": "https://example.invalid", "token": None,
-                                      "with_reauth": staticmethod(lambda fn: fn())})()
+                                      "with_reauth": staticmethod(_no_network)})()
 
     def has_tool(self, name):
         return name in self._tools
@@ -182,11 +188,16 @@ def test_a_complete_scan_carries_no_warning():
     assert "instruction" not in domain.where_is_item_used(_live_shape(), ITEM_ID)
 
 
-def test_boms_outside_the_seat_are_refused_rather_than_answered_emptily():
+def test_boms_outside_the_seat_are_refused_rather_than_answered_emptily(monkeypatch):
+    probed = []
+    monkeypatch.setattr(domain, "_rest_status", lambda mcp, entity: probed.append(entity) or 403)
     mcp = FakeMcp(items=[_item()], boms=[], tools=("Item.list",))
     out = domain.where_is_item_used(mcp, ITEM_ID)
     assert out["error"] == "BOM not readable by this seat"
+    assert out["found"] is True and out["item"]["id"] == ITEM_ID
+    assert out["outside_seat"] is True and probed == ["BOM"]
     assert "consumed_in_boms" not in out, "an empty list here would read as 'used nowhere'"
+    assert ("BOM.list_all", {}) not in mcp.calls
 
 
 # --------------------------------------------------------------- payload and wiring

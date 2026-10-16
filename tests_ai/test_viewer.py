@@ -155,6 +155,19 @@ def test_start_runs_the_harness_cli_into_the_demo_directory(tmp_path):
     assert status["run_root"] == "20260930-120000-000001"
 
 
+@pytest.mark.skipif(jobs_module.fcntl is None, reason="no flock on this platform")
+def test_the_child_is_told_which_inherited_fd_holds_the_run_lock(tmp_path):
+    """harness.runner takes the run lock itself; flock is per open file description, so without the fd's number a
+    console-launched runner would be refused by the very lock its parent handed it."""
+    procs = []
+    JobRunner(TASKS, tmp_path / "demo", popen=fake_popen(procs)).start("refuse_x", "keystone", "keystone/refuse_x")
+
+    [proc] = procs
+    [fd] = proc.kwargs["pass_fds"]
+    assert proc.kwargs["env"]["HARNESS_RUN_LOCK_FD"] == str(fd)
+    assert proc.kwargs["env"]["PATH"] == os.environ["PATH"], "the rest of the environment is passed on unchanged"
+
+
 @pytest.mark.parametrize("task,instance,confirm", [
     ("not_a_task", "suryodaya", "suryodaya/not_a_task"),
     ("why_late", "keystone", "keystone/why_late"),

@@ -9,5 +9,5 @@
   "fixture": "late_draft_chain",
   "prompt": "{upstream_number} is late. Find out why, tell me what it blocks downstream, and reschedule what you can. Apply the changes you are allowed to make.",
   "verifier": "harness.verifiers.team04:reschedule_fixture_chain",
-  "checks": "Fixture drafts re-dated in DB (upstream from today, downstream after it), written by this seat, nothing else written."
+  "checks": "Fixture drafts re-dated in DB (upstream from today, downstream after it), written by this seat, nothing else written, and the finding (about the upstream, answered or partial) records both as applied. The fixture picks a chain whose upstream has no undated blocker by the product's own rule (domain.diagnose) and records that in fixture.json. Unevaluated if the upstream has no committable date after all: blockers recorded at setup, an undated blocker REST shows (a draft or overdue subcontract, a rejected inspection, an active breakdown on its job cards' workstations), or, not independently confirmed, the run's own propose_reschedule saying so. Subject and outcome rules: harness/verifiers/team04.py docstring."
 }

@@ -9,5 +9,5 @@
   "interference": "edit_dates_before_apply",
   "prompt": "{upstream_number} is late. Find out why, tell me what it blocks downstream, and reschedule what you can. Apply the changes you are allowed to make.",
   "verifier": "harness.verifiers.team04:concurrent_edit_preserved",
-  "checks": "Between the agent's proposal and its write, the harness moves the fixture order's dates (another team, in effect). The DB must still hold that edit, the write must report changed_underneath, no further write may follow in the run, and the conflict must be recorded and escalated."
+  "checks": "Between the agent's proposal and its write, the harness moves the fixture order's dates (another team, in effect). The DB must still hold that edit, the write must report changed_underneath, no further write may follow in the run, and the conflict must be recorded (in a finding about the fixture upstream, answered or partial) and escalated. If no write was attempted, unevaluated when the upstream had no committable date (see reschedule_fixture_chain), otherwise revise. Subject and outcome rules: harness/verifiers/team04.py docstring."
 }

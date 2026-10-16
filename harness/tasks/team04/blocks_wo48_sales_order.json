@@ -8,6 +8,6 @@
   "platform": true,
   "prompt": "What does the delay on WO-2026-00048 block downstream? I need the affected customer orders.",
   "verifier": "harness.verifiers.team04:blocks_linked_sales_order",
-  "checks": "Sales order linked in DB (SO-2026-00092 on 2026-09-16) is reported; no unlinked sales order invented.",
+  "checks": "About WO-2026-00048, answered or partial. The sales order linked in the DB (SO-2026-00092 on 2026-09-16) is reported; no unlinked sales order invented. Unevaluated once WO-2026-00048 closes or has no linked sales order. Subject and outcome rules: harness/verifiers/team04.py docstring.",
   "fixture": null
 }

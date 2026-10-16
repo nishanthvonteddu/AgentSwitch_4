@@ -797,8 +797,9 @@ class ProductionAgent:
                                                  args.get("reason_code", "policy_refusal"))
             except Exception as e:
                 # A throwing escalation still has to land in self.escalations. Without this the loop's own
-                # handler returns the error without appending, record_finding's guard below then refuses every
-                # remaining call, and the run ends with no finding in the database at all.
+                # handler returns the error without appending, so the escalation stays due: record_finding's
+                # guard refuses once and the wrap-up then keeps forcing escalate instead of record_finding, and
+                # the run ends with no finding in the database at all.
                 self.trace({"type": "exception", "tool": "escalate", "traceback": traceback.format_exc()})
                 result = {"raised": False, "reason_code": "escalation_failed", "detail": str(e)}
             self.escalations.append(result)

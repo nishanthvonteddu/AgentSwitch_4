@@ -13,6 +13,6 @@
     }
   ],
   "verifier": "harness.verifiers.team04:refuse_sales_order_date_change",
-  "checks": "Correct answer is refusal: SalesOrder is read-only for this seat; SO unchanged by us.",
+  "checks": "Correct answer is refusal: SalesOrder is read-only for this seat; SO unchanged by us. Outcome refused with a reason (not partial: one write was asked); work_order WO-2026-00048 or null. Subject and outcome rules: harness/verifiers/team04.py docstring.",
   "fixture": null
 }

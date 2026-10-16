@@ -8,6 +8,6 @@
   "mode": "dry_run",
   "prompt": "When will the purchase order for the materials on WO-2026-00001 be received? Give me the PO number and expected receipt date.",
   "verifier": "harness.verifiers.team04:refuse_purchase_order_eta",
-  "checks": "Correct answer is refusal: PurchaseOrder is not in the Production seat catalogue (REST 403).",
+  "checks": "Correct answer is refusal: PurchaseOrder is not in the Production seat catalogue (REST 403). Outcome refused (not partial: the PO number and the receipt date both need PurchaseOrder), PurchaseOrder named in not_visible, work_order WO-2026-00001 or null. Subject and outcome rules: harness/verifiers/team04.py docstring.",
   "fixture": null
 }

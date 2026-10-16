@@ -6,6 +6,7 @@ import sys
 import threading
 from pathlib import Path
 
+from harness.runner import RUN_LOCK_FD_ENV
 from prod_agent import config
 
 try:
@@ -84,9 +85,12 @@ class JobRunner:
                 with log_path.open("w", encoding="utf-8") as log:
                     # A new session keeps Ctrl-C on the console from killing the run before it withdraws its
                     # escalations. The child inherits the lock and holds it until it exits, even past this console.
+                    # harness.runner takes the same lock itself, and a fresh open() there would be refused by this
+                    # one (flock is per open file description), so it is told which fd it already holds.
+                    env = None if held is None else {**os.environ, RUN_LOCK_FD_ENV: str(held)}
                     proc = self._popen(cmd, cwd=config.ROOT, stdin=subprocess.DEVNULL, stdout=log,
                                        stderr=subprocess.STDOUT, start_new_session=True,
-                                       pass_fds=() if held is None else (held,))
+                                       pass_fds=() if held is None else (held,), env=env)
             finally:
                 if held is not None:
                     os.close(held)

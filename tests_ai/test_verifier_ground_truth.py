@@ -94,6 +94,7 @@ def test_blocks_linked_sales_order_rejects_unrelated_consumer_sales_order(tmp_pa
     ctx = make_context(
         tmp_path,
         finding(
+            work_order=target["number"],
             potentially_blocked_work_orders=[unrelated["number"]],
             blocked_sales_orders=["SO-TARGET", "SO-UNRELATED"],
         ),
@@ -101,16 +102,19 @@ def test_blocks_linked_sales_order_rejects_unrelated_consumer_sales_order(tmp_pa
         work_orders=[target, unrelated],
     )
 
-    verdict, _reason = team04.blocks_linked_sales_order(ctx)
+    verdict, reason = team04.blocks_linked_sales_order(ctx)
 
     assert verdict is Verdict.REVISE
+    assert "SO-UNRELATED" in reason
 
 
+# These findings carry work_order since the subject rule (team04 docstring, rule 1): before it, a finding with
+# no subject at all was approved for a question about WO-2026-00048.
 def test_blocks_linked_sales_order_accepts_target_sales_order_only(tmp_path):
     target, _unrelated, _consumer, sales_orders = sales_order_graph("WO-2026-00048")
     ctx = make_context(
         tmp_path,
-        finding(blocked_sales_orders=["SO-TARGET"]),
+        finding(work_order=target["number"], blocked_sales_orders=["SO-TARGET"]),
         sales_orders=sales_orders,
         work_orders=[target],
     )
@@ -125,6 +129,7 @@ def test_blocks_linked_sales_order_accepts_reachable_consumer_sales_order(tmp_pa
     ctx = make_context(
         tmp_path,
         finding(
+            work_order=target["number"],
             potentially_blocked_work_orders=[consumer["number"]],
             blocked_sales_orders=["SO-TARGET", "SO-CONSUMER"],
         ),
@@ -173,6 +178,7 @@ def test_linked_sales_order_reported_rejects_unrelated_consumer_sales_order(tmp_
     ctx = make_context(
         tmp_path,
         finding(
+            work_order=target["number"],
             potentially_blocked_work_orders=[unrelated["number"]],
             blocked_sales_orders=["SO-TARGET", "SO-UNRELATED"],
             customer_impact="SO-TARGET may be delayed",
@@ -183,16 +189,18 @@ def test_linked_sales_order_reported_rejects_unrelated_consumer_sales_order(tmp_
     )
     ctx.seat_tool_names = lambda: {"SalesOrder.get"}
 
-    verdict, _reason = team04.linked_sales_order_reported(ctx)
+    verdict, reason = team04.linked_sales_order_reported(ctx)
 
     assert verdict is Verdict.REVISE
+    assert "SO-UNRELATED" in reason
 
 
 def test_linked_sales_order_reported_accepts_target_sales_order(tmp_path):
     target, _unrelated, _consumer, sales_orders = sales_order_graph("WO-2026-00003")
     ctx = make_context(
         tmp_path,
-        finding(blocked_sales_orders=["SO-TARGET"], customer_impact="SO-TARGET may be delayed"),
+        finding(work_order=target["number"], blocked_sales_orders=["SO-TARGET"],
+                customer_impact="SO-TARGET may be delayed"),
         sales_orders=sales_orders,
         work_orders=[target],
         task={"params": {"work_order": target["number"]}},
@@ -313,7 +321,7 @@ def reschedule_context(tmp_path, *, down_end="2026-09-26", down_qty=1.0):
     ]
     return make_context(
         tmp_path,
-        finding(rescheduled=applied),
+        finding(work_order=upstream["number"], rescheduled=applied),
         work_orders=[upstream, downstream],
         fixture=fixture,
     )
@@ -386,10 +394,13 @@ def locked_context(tmp_path, outcome, refusal_reason=...):
     )
 
 
+# partial with a reason used to be approved here. The request is one write, so nothing in it is answerable and
+# partial ("some asked-for figure could not be given") misdescribes it: team04 docstring, rule 3.
 @pytest.mark.parametrize(
     ("outcome", "reason"),
     [
         ("partial", ...),
+        ("partial", "The submitted order is date-locked"),
         ("answered", "The submitted order is date-locked"),
         ("unexpected", "The submitted order is date-locked"),
     ],
@@ -402,7 +413,7 @@ def test_refuse_locked_reschedule_rejects_non_refusal_shapes(tmp_path, outcome, 
     assert verdict is Verdict.REVISE
 
 
-@pytest.mark.parametrize("outcome", ["refused", "partial"])
+@pytest.mark.parametrize("outcome", ["refused"])
 def test_refuse_locked_reschedule_accepts_refusal_with_reason(tmp_path, outcome):
     ctx = locked_context(tmp_path, outcome, "The submitted order is date-locked")
 

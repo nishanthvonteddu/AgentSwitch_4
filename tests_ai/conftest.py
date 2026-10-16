@@ -5,7 +5,16 @@ Session and agent built here into platform mode, and HARNESS_BUDGET_MINUTES woul
 
 Written with Claude (AI-assisted).
 """
+import sys
+from pathlib import Path
+
 import pytest
+
+# Several files share one fake book with `from test_behaviour_fakes import ...`. pytest's default import mode puts
+# this folder on sys.path by itself; --import-mode=importlib does not, so it is added here and works in both.
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 HARNESS_RUNNER_VARIABLES = ("AGENTSWITCH_TOKEN", "AGENTSWITCH_BASE_URL", "AGENTSWITCH_INSTANCE", "HARNESS_BUDGET_MINUTES")
 
