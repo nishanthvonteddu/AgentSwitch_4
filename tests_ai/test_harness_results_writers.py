@@ -56,6 +56,38 @@ def test_two_processes_writing_the_same_file_both_finish(tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["results.json"]
 
 
+def _refuse_twice(monkeypatch):
+    """os.replace as Windows answers it while another writer holds the target: refused, then allowed."""
+    real, calls = results.os.replace, []
+
+    def replace(src, dst):
+        calls.append(dst)
+        if len(calls) <= 2:
+            raise PermissionError(13, "Access is denied")
+        real(src, dst)
+    monkeypatch.setattr(results.os, "replace", replace)
+    monkeypatch.setattr(results.time, "sleep", lambda s: None)
+    return calls
+
+
+def test_on_windows_a_refused_replace_is_retried(tmp_path, monkeypatch):
+    """Seen 2026-10-16 on Windows: the two-process test died on WinError 5 from os.replace."""
+    calls = _refuse_twice(monkeypatch)
+    monkeypatch.setattr(results.os, "name", "nt")
+    write_atomic(tmp_path / "results.json", {"v": 1})
+
+    assert len(calls) == 3
+    assert json.loads((tmp_path / "results.json").read_text(encoding="utf-8")) == {"v": 1}
+
+
+def test_elsewhere_a_refused_replace_is_a_real_error(tmp_path, monkeypatch):
+    _refuse_twice(monkeypatch)
+    monkeypatch.setattr(results.os, "name", "posix")
+    with pytest.raises(PermissionError):
+        write_atomic(tmp_path / "results.json", {"v": 1})
+    assert list(tmp_path.iterdir()) == [], "no temp file left behind"
+
+
 def test_a_failed_write_leaves_the_old_file_and_no_temp_file(tmp_path, monkeypatch):
     path = tmp_path / "results.json"
     write_atomic(path, {"v": 1})

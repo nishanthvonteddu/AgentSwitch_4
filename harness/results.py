@@ -17,6 +17,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 RESULTS_NAME = "results.json"  # agentswitch-harness.toml: results = "results.json"
@@ -79,6 +80,23 @@ def problems(doc) -> list[str]:
     return found
 
 
+REPLACE_ATTEMPTS = 20  # about 2 s of backing off in all, far longer than any one write holds the file
+
+
+def _replace(tmp: str, path: Path) -> None:
+    """os.replace, retried on Windows only. There, replacing a file that another process is replacing or reading
+    at that instant is refused with PermissionError (WinError 5) instead of happening atomically as on POSIX, and
+    the run lock that keeps two runs apart is POSIX-only too (runner.hold_run_lock)."""
+    for attempt in range(REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if os.name != "nt" or attempt == REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(0.01 * (attempt + 1))
+
+
 def write_atomic(path: Path, doc: dict) -> None:
     """Replace the file in one step, so the runner never reads a half-written one if it stops us mid-write.
 
@@ -91,7 +109,7 @@ def write_atomic(path: Path, doc: dict) -> None:
             json.dump(doc, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        _replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
