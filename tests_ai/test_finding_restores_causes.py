@@ -24,6 +24,7 @@ def _agent(diag=DIAG, ref="WO-2026-00049"):
     agent = ProductionAgent.__new__(ProductionAgent)
     agent._reads = {("diagnose", ref): diag} if diag is not None else {}
     agent._diagnoses = {}
+    agent._numbers = {}  # _order_key reads it: an id is compared by the number a tool result paired it with
     return agent
 
 

@@ -88,4 +88,19 @@ def test_the_rejected_subject_is_not_restored_onto_the_retry():
 
     [stored] = book.recorded_findings()
     assert stored["work_order"] == "WO-2026-00073", "the blamed field must come from the retry"
-    assert stored["is_late"] is True, "a field the retry dropped is carried over from the first attempt"
+    # Changed 2026-10-17: this once asserted is_late True was carried over. That value was typed about WO-2026-00116;
+    # the retry is about another order, so nothing from the refused attempt is restored onto it.
+    assert "is_late" not in stored, "a field typed about another order is not carried onto this one"
+
+
+def test_a_retry_about_the_same_order_still_gets_its_dropped_fields_back():
+    book = _two_orders()
+    agent = _looked_up_73(book)
+    agent._dispatch("record_finding", finding("WO-2026-00116", is_late=True))
+
+    retry = finding("WO-2026-00116")
+    del retry["is_late"]
+    agent._dispatch("record_finding", retry)
+
+    [stored] = book.recorded_findings()
+    assert stored["work_order"] == "WO-2026-00116" and stored["is_late"] is True

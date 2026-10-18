@@ -10,13 +10,15 @@ it worse.
 Every guard in record_finding ends with "call record_finding again", so this is a property of all
 of them, not of the cost check.
 """
+from types import SimpleNamespace
+
 from prod_agent.agent import ProductionAgent
 
 
 def _agent() -> ProductionAgent:
-    agent = ProductionAgent.__new__(ProductionAgent)
-    agent._rejected_finding_args = {}
-    return agent
+    # The real constructor: restoring now compares the retry's order with the refused attempt's, which reads state
+    # a bare __new__ never had.
+    return ProductionAgent(SimpleNamespace(session=SimpleNamespace(instance="suryodaya")), llm=object(), model="m")
 
 
 def test_the_live_failure_does_not_repeat():
@@ -62,8 +64,6 @@ def test_a_wrong_shape_is_not_restored_onto_the_retry():
     field names, so the bad value was kept. A retry that dropped the field got it back and was
     refused again, and that guard has no once-only limit, so a run could end with no finding."""
     agent = _agent()
-    agent.finding, agent._applied, agent._conflicted, agent._reads, agent._diagnoses = None, {}, {}, {}, {}
-    agent._missing, agent._numbers, agent._unread_lanes = set(), {}, {}
     refused = agent._dispatch("record_finding", {"work_order": "WO-2026-00048",
                                                  "escalations": ["raised it to the plant head"]})
     assert refused["error"] == "these fields have the wrong shape"
