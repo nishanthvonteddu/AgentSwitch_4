@@ -484,7 +484,21 @@ def test_a_projected_finish_already_past_counts_from_today():
     target = book.tables["WorkOrder"][0]
     target["status"] = "in_progress"
     book.schedule = [schedule_entry(target, "late", projected_finish="2026-09-10")]
-    assert _proposals(book)["WO-B"]["new_start"] == "2026-09-17"
+    proposal = _proposals(book)["WO-B"]
+    assert proposal["new_start"] == "2026-09-17"
+    # Review: the reason called today's date the platform's projection. It must give the platform's own date.
+    assert "projected WO-A to finish 2026-09-10, already past" in proposal["reason"]
+    assert "counts from today, 2026-09-16" in proposal["reason"]
+
+
+def test_a_future_projected_finish_is_named_as_the_platforms_date():
+    book = _chain_book()
+    target = book.tables["WorkOrder"][0]
+    target["status"] = "in_progress"
+    book.schedule = [schedule_entry(target, "late", projected_finish="2026-09-25")]
+    proposal = _proposals(book)["WO-B"]
+    assert proposal["new_start"] == "2026-09-26"
+    assert "date from the platform's projected finish for WO-A, 2026-09-25" in proposal["reason"]
 
 
 def test_a_running_order_with_an_undated_blocker_dates_nothing_even_with_a_projection():

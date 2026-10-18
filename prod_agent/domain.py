@@ -619,7 +619,13 @@ def propose_reschedule(mcp: McpClient, ref: str, diag: dict | None = None, down:
         upstream_end[num] = new_end
         reason = f"must start after {parent} finishes"
         if parent == tnum and target["status"] == "in_progress":
-            reason += f" (date from the platform's projected finish for {tnum}, {_iso(target_end)})"
+            # Say whose date it is. A projection already past is not the platform's date for the dependant: the plan
+            # then counts from today, and the person approving the write must see that, not today labelled as its.
+            if projected < today:
+                reason += (f" (the platform projected {tnum} to finish {_iso(projected)}, already past, so this "
+                           f"counts from today, {_iso(today)})")
+            else:
+                reason += f" (date from the platform's projected finish for {tnum}, {_iso(projected)})"
         proposals.append(proposal(w, new_start, new_end, reason))
 
     return {"found": True, "work_order": target, "today": _iso(today), "proposals": proposals,
