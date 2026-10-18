@@ -152,6 +152,25 @@ def test_a_cause_the_model_left_out_is_restored_into_the_stored_finding():
     assert {"SCO-2026-00024", "MR-2026-00005", "WO-2026-00049"} <= set(stored["evidence_records"])
 
 
+def test_the_stock_and_subcontract_stage_codes_reach_the_stored_finding_on_their_side():
+    """stock_unverified blocks and the goods-back subcontract codes contribute, all as bare codes the guards accept."""
+    wo = work_order("WO-2026-00066", "in_progress", start="2026-08-20", end="2026-09-10")
+    scos = [{"id": f"s-{n}", "number": f"SCO-2026-0005{n}", "work_order_id": wo["id"], "status": status,
+             "expected_delivery_date": "2026-09-01", "vendor_id": "v-1"}
+            for n, status in ((1, "received"), (2, "quality_check"))]
+    book = Book(tables={"WorkOrder": [wo], "SubcontractOrder": scos}, stock={wo["id"]: [
+        {"item_id": "item-x", "required": 3, "available": 0, "shortage": 3, "is_critical": True}]})
+    agent = agent_on(book)
+    agent._dispatch("diagnose_work_order", {"work_order": "WO-2026-00066"})
+
+    agent._dispatch("record_finding", finding("WO-2026-00066"))
+
+    [stored] = book.recorded_findings()
+    assert stored["blocking_causes"] == ["stock_unverified"]
+    assert {"subcontract_received", "subcontract_in_inspection"} <= set(stored["contributing_causes"])
+    assert {"SCO-2026-00051", "SCO-2026-00052"} <= set(stored["evidence_records"])
+
+
 def test_causes_are_restored_even_when_the_run_never_diagnosed_the_order():
     """2026-10-12: the model reached its finding through propose_reschedule's dates alone and named no cause."""
     book = _wo49()
