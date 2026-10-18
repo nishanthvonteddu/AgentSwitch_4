@@ -89,7 +89,7 @@ The single most important line in the codebase is the blocking test:
 
 ```python
 UNDATED_BLOCKERS = {
-    "subcontract_not_sent", "subcontract_overdue", "material_shortage",
+    "subcontract_not_sent", "subcontract_overdue", "material_shortage", STOCK_UNVERIFIED,
     "quality_rejected", "workstation_unavailable",
     "engineering_change_pending", "workstation_breakdown_active",
 }
@@ -98,6 +98,28 @@ UNDATED_BLOCKERS = {
 A cause is **blocking** if it has no knowable ready date. Everything else is **contributing**. That
 distinction is what lets the agent say "I will not commit a new date" honestly, instead of inventing one.
 If you add a new cause code, decide which side of this set it belongs on — that decision is the behaviour.
+
+Decisions that set a signal's side, each pinned in `tests_ai/test_behaviour_domain.py`:
+
+- **Stock that reads 0 everywhere.** When every component of the order reports 0 available, the platform's known
+  always-0 defect cannot be told apart from a genuinely empty store. `diagnose` then emits one `stock_unverified`
+  (blocking, carrying each short item's required/available/shortage) instead of a `material_shortage` per line,
+  and `order_feasible_by` answers `unknown` ("stock could not be confirmed") when that is the only blocker; any
+  other undated blocker, or a date already past, is still `no`. If at least one component reports stock, the check
+  is believed and each short line is a blocking `material_shortage`. It is decided per response, not by a flag:
+  once the defect is confirmed fixed, setting `all_zero = False` in `diagnose` is the whole change.
+- **Subcontract stages** (`SubcontractOrderFlow`: draft → submitted → materials_sent → in_progress → received →
+  quality_check → completed). `draft` is `subcontract_not_sent` (blocking). `submitted`, `materials_sent` and
+  `in_progress` are `subcontract_overdue` (blocking) once `expected_delivery_date` has passed, otherwise
+  `subcontract_pending` with that date as `ready_date`. `received` (`subcontract_received`) and `quality_check`
+  (`subcontract_in_inspection`) mean the goods are back, so they contribute and never block; no inspection finish
+  date is recorded, so none is given. Every one carries status, expected date and vendor. The harness's own copy
+  of the rule (`_undated_blockers` in `harness/verifiers/team04.py`) agrees stage by stage.
+- **Drafts are late on purpose.** `OPEN_WO` includes `draft`, so a draft past its planned end is late. The
+  platform's own late query and dashboard leave drafts out; we include them because a past-due draft is still an
+  order nobody released, and the harness's own late orders are exactly that (`late_draft_chain`,
+  `complex_planted_instruction`). `diagnose` always adds `not_released` for a draft, so the answer says the late
+  order is an unreleased draft.
 
 Two things `diagnose` deliberately throws away:
 
@@ -109,6 +131,20 @@ Two things `diagnose` deliberately throws away:
 `potentially_blocked_work_orders` with `confidence: potential` — **never** "blocked" — because stock or
 another order may already cover that demand. A sales order counts as `linked` only when it sits on the
 late order itself.
+
+Its `customer_impact` says how much of the customer side is actually known. `undeterminable` means the seat has
+no `SalesOrder.get`. `unknown` means every linked sales order failed to read, and names each one (its number when
+the work order carries `_sales_order_id_display`, else its id) with the platform's error kind. `partly unknown`
+means some were read and some were not, or a make-to-order order in the chain has no sales order; when both apply
+the causes are listed side by side, separated by `; `. `known` means every linked sales order was read. Only
+`none linked` — no order in the chain carries a `sales_order_id` at all — lets the agent say no customer is
+affected.
+
+`propose_reschedule` dates dependants from the target's end. A completed or cancelled target constrains nothing:
+its dependants get no proposal on its account and pass their own planned end on to orders waiting on them. An
+`in_progress` target is not moved; its dependants start the day after `max(projected_finish, today)` from the
+platform's schedule, unless the target has an undated blocker (the projection cannot see it) or no projected finish,
+in which case they are not committable and say why. A proposal that cannot be committed always names what stops it.
 
 ---
 

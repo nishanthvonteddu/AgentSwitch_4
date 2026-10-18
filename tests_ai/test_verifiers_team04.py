@@ -13,10 +13,11 @@ import itertools
 import json
 
 import pytest
+from test_behaviour_fakes import Book
 
 from harness.verifiers import team04 as v
 from harness.verify import Verdict, VerifyContext
-from prod_agent import config
+from prod_agent import config, domain
 from prod_agent.mcp_client import McpError
 
 A, R, U = Verdict.APPROVE, Verdict.REVISE, Verdict.UNEVALUATED
@@ -539,6 +540,20 @@ def test_regression_linked_sales_order_reported_revises_subject_refusal_and_unde
     assert verdict(v.linked_sales_order_reported, wo4_ctx(tmp_path, finding)) is R
 
 
+def test_linked_sales_order_reported_revises_none_linked_for_a_linked_order(tmp_path):
+    """downstream_impact says "none linked" only when no order in the chain carries a sales_order_id."""
+    finding = answer(WO4, blocked_sales_orders=["SO-3"], customer_impact="none linked: no sales order on this order")
+    verdict_, reason = v.linked_sales_order_reported(wo4_ctx(tmp_path, finding))
+    assert verdict_ is R and "none linked" in reason
+
+
+@pytest.mark.parametrize("impact", ["known", "partly unknown: read SO-3 via WO-2026-00004; could not read so-9 via "
+                                    "WO-2026-00009: permission_denied", "unknown: could not read so-9 via X: not_found"])
+def test_linked_sales_order_reported_does_not_grade_an_honest_failed_read(tmp_path, impact):
+    finding = answer(WO4, blocked_sales_orders=["SO-3"], customer_impact=impact)
+    assert verdict(v.linked_sales_order_reported, wo4_ctx(tmp_path, finding)) is A
+
+
 def test_linked_sales_order_reported_without_link_is_unevaluated(tmp_path):
     assert verdict(v.linked_sales_order_reported, wo4_ctx(tmp_path, answer(WO4), linked=False)) is U
 
@@ -712,6 +727,32 @@ def test_reschedule_fixture_chain_finished_breakdown_is_not_a_blocker(tmp_path):
     rows = {"WorkOrder": [up, down], "JobCard": [{"id": "j", "work_order_id": up["id"], "workstation_id": "w1"}],
             "DowntimeEntry": [{"id": "d", "workstation_id": "w1", "reason": "breakdown", "from_time": "2026-09-01",
                                "to_time": "2026-09-02"}]}
+    ctx = make_ctx(tmp_path, rows=rows, fixture=fixture, finding=answer("WO-UP", rescheduled=APPLIED), tools=[])
+    assert verdict(v.reschedule_fixture_chain, ctx) is A
+
+
+SCO_STAGES = ["draft", "submitted", "materials_sent", "in_progress", "received", "quality_check", "completed", "cancelled"]
+
+
+@pytest.mark.parametrize("status", SCO_STAGES)
+def test_undated_blockers_agrees_with_diagnose_on_every_subcontract_stage(tmp_path, status):
+    """The verifier keeps its own copy of the rule; both must call the same stages undated blockers, so an upstream
+    whose subcontract goods are back is not scored unevaluated while the product rightly dates it."""
+    up =wo("WO-UP", "draft", item_id="i-up")
+    sco = {"id": "s", "number": "SCO-9", "status": status, "work_order_id": up["id"],
+           "expected_delivery_date": "2026-09-01", "vendor_id": "v"}  # past on TODAY
+    found = v._undated_blockers(make_ctx(tmp_path, rows={"WorkOrder": [up], "SubcontractOrder": [sco]}), up)
+    diag = domain.diagnose(Book(tables={"WorkOrder": [up], "SubcontractOrder": [sco]}), "WO-UP")
+    product = [s["code"] for s in diag["signals"] if s["code"].startswith("subcontract_") and s["blocking"]]
+    assert [f.split(" ")[0] for f in found] == product
+    assert bool(found) is (status in ("draft", "submitted", "materials_sent", "in_progress"))
+
+
+@pytest.mark.parametrize("status", ["received", "quality_check"])
+def test_reschedule_fixture_chain_grades_an_upstream_whose_subcontract_goods_are_back(tmp_path, status):
+    up, down, fixture = chain()
+    rows = {"WorkOrder": [up, down], "SubcontractOrder": [{"id": "s", "number": "SCO-9", "status": status,
+                                                          "work_order_id": up["id"], "expected_delivery_date": "2026-09-01"}]}
     ctx = make_ctx(tmp_path, rows=rows, fixture=fixture, finding=answer("WO-UP", rescheduled=APPLIED), tools=[])
     assert verdict(v.reschedule_fixture_chain, ctx) is A
 
@@ -980,6 +1021,14 @@ def test_regression_bottleneck_lanes_reported_revises_an_unreadable_lane_left_as
 
 def test_regression_bottleneck_lanes_reported_revises_an_invented_record_beside_a_real_one(tmp_path):
     assert verdict(v.bottleneck_lanes_reported, bottleneck_ctx(tmp_path, lanes_finding(("QI-2026-00001", "SCO-2026-00404")))) is R
+
+
+@pytest.mark.parametrize("status", ["received", "quality_check"])
+def test_bottleneck_lanes_reported_still_counts_a_subcontract_whose_goods_are_back_as_open(tmp_path, status):
+    """Not an undated blocker any more, but still not completed: citing it is citing a real open subcontract."""
+    ctx = bottleneck_ctx(tmp_path, lanes_finding(("SCO-2026-00001",)))
+    ctx.rest.rows["SubcontractOrder"][0]["status"] = status
+    assert verdict(v.bottleneck_lanes_reported, ctx) is A
 
 
 def test_regression_bottleneck_lanes_reported_does_not_count_a_rejection_on_a_closed_order(tmp_path):

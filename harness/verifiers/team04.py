@@ -55,6 +55,9 @@ REFUSED_OR_PARTIAL = {"refused", "partial"}
 OPEN_WO = {"draft", "not_started", "in_progress", "stopped"}
 OPEN_MR = {"draft", "submitted", "partially_ordered", "ordered"}
 DONE_SCO = {"completed", "cancelled"}
+# Goods back from the vendor (SubcontractOrderFlow: ... -> received -> quality_check -> completed): a past expected
+# delivery date no longer means a late vendor, so neither is an undated blocker, as domain.diagnose rules.
+SCO_GOODS_BACK = {"received", "quality_check"}
 CHECKED_CAUSES = ("stopped_without_recorded_reason", "not_started_past_planned_start",
                   "subcontract_not_sent", "material_request_open")
 
@@ -596,6 +599,10 @@ def linked_sales_order_reported(ctx: VerifyContext):
         return R, f"reported sales orders with no link in the DB: {sorted(invented)}"
     if str(f.get("customer_impact") or "").startswith("undeterminable"):
         return R, "called customer impact undeterminable although the sales order is readable"
+    # downstream_impact says "none linked" only when no order in the chain carries a sales_order_id; this one does.
+    # A failed read is "unknown" or "partly unknown" there, which is not graded: it reports what the run saw.
+    if str(f.get("customer_impact") or "").startswith("none linked"):
+        return R, f"called customer impact none linked although the DB links {expected} to {number}"
     return A, f"reported {expected} linked to {number}"
 
 
@@ -705,7 +712,7 @@ def _undated_blockers(ctx: VerifyContext, wo: dict) -> list[str]:
             continue
         if s.get("status") == "draft":
             found.append(f"subcontract_not_sent ({s.get('number')})")
-        elif (s.get("expected_delivery_date") or "9999")[:10] < today:
+        elif s.get("status") not in SCO_GOODS_BACK and (s.get("expected_delivery_date") or "9999")[:10] < today:
             found.append(f"subcontract_overdue ({s.get('number')})")
     # Unfiltered reads, as bottleneck_lanes_reported and downtime_top_workstation make: these REST filters are
     # not used anywhere else, so they are applied here rather than assumed of the server.
@@ -1100,6 +1107,10 @@ def bottleneck_lanes_reported(ctx: VerifyContext):
     subcontracts = ctx.rest.list("SubcontractOrder")
     open_wo_ids = {w["id"] for w in ctx.rest.list("WorkOrder") if w.get("status") in OPEN_WO}
     rejected = [q for q in inspections if q.get("overall_result") == "rejected" and q.get("reference_id") in open_wo_ids]
+    # received and quality_check stay in: "stuck" here is a subcontract not yet completed, not one with no ready date
+    # (_undated_blockers keeps them out of that). The cockpit's items do not say which subcontract statuses its lane
+    # holds (runs/ show only state "ready", diagnostic "subcontract_review"), so dropping them could revise a finding
+    # that cites a real open subcontract the cockpit showed.
     stuck_sco = [s for s in subcontracts
                  if s.get("status") not in DONE_SCO and s.get("work_order_id") in open_wo_ids]
     if not rejected and not stuck_sco:
