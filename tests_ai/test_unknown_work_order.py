@@ -23,8 +23,11 @@ REQUEST = "WO-2026-09999 is late. Find out why, tell me what it blocks downstrea
 def persisted(monkeypatch):
     monkeypatch.setattr(config, "load_dotenv", lambda *args, **kwargs: None)
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    # A found order's diagnosis carries the cause finding() names: record_finding removes a cause code its order's
+    # diagnosis does not contain (live 2026-10-18), and these tests are about the subject, not the causes.
     monkeypatch.setattr(domain, "diagnose", lambda mcp, ref: {"found": False, "ref": ref} if ref.endswith("09999")
-                        else {"found": True, "work_order": {"number": ref}, "signals": []})
+                        else {"found": True, "work_order": {"number": ref}, "signals": [
+                            {"code": "engineering_change_pending", "blocking": True, "record": None}]})
     rows = []
     monkeypatch.setattr(domain, "record_finding", lambda mcp, run_id, finding: rows.append(finding) or {"run_id": run_id})
     return rows
