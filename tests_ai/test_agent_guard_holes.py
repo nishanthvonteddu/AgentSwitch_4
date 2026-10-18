@@ -356,3 +356,36 @@ def test_c5b_an_order_the_request_named_is_still_diagnosed_for_causes():
     agent._examined = {"WO-2026-00116"}
     agent._dispatch("record_finding", finding("wo-2026-00116"))
     assert "stopped_without_recorded_reason" in book.recorded_findings()[0]["contributing_causes"]
+
+
+def test_c6_an_unpadded_lookup_that_misses_does_not_mark_an_existing_order_missing(monkeypatch):
+    """Review: _wo_key reads WO-2026-73 as WO-2026-00073, but the platform matches numbers exactly, so that lookup
+    finds nothing even though WO-2026-00073 exists. The miss was taken as proof the asked order does not exist, and
+    record_finding then told the model to refuse an order that was right there."""
+    exact = {"WO-2026-00073", "WO-2026-00116"}
+
+    def diagnose(mcp, ref):  # like domain.resolve_work_order: an exact number, case aside
+        if ref.upper() in exact:
+            return {"found": True, "work_order": {"number": ref.upper(), "id": f"id-{ref.upper()}"}, "signals": []}
+        return {"found": False, "ref": ref}
+
+    monkeypatch.setattr(domain, "diagnose", diagnose)
+    rows = []
+    monkeypatch.setattr(domain, "record_finding", lambda mcp, run_id, f: rows.append(f) or {"run_id": run_id})
+    agent, first = _run("What does WO-2026-00073 block?", ["WO-2026-73", "WO-2026-00073", "WO-2026-00116"],
+                        finding("WO-2026-00073"))
+
+    assert "was asked about and does not exist" not in json.dumps(first)
+    assert not agent.missing_orders and rows and rows[0]["work_order"] == "WO-2026-00073"
+
+
+def test_c6_an_unpadded_miss_tells_the_model_to_retry_in_the_platforms_form(monkeypatch):
+    monkeypatch.setattr(domain, "diagnose", lambda mcp, ref: {"found": False, "ref": ref})
+    agent = ProductionAgent(SimpleNamespace(session=SimpleNamespace(instance="suryodaya")), llm=object(), model="m")
+    out = agent._dispatch("diagnose_work_order", {"work_order": "WO-2026-73"})
+    assert "five-digit" in out["instruction_for_agent"]
+    assert "does not exist on this instance" not in out["instruction_for_agent"]
+    assert not agent.missing_orders
+    padded = agent._dispatch("diagnose_work_order", {"work_order": "WO-2026-09999"})
+    assert "does not exist on this instance" in padded["instruction_for_agent"]
+    assert agent.missing_orders == {"WO-2026-09999"}

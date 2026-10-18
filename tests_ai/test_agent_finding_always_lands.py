@@ -226,7 +226,7 @@ def test_h2_under_a_deadline_escalate_never_takes_the_finding_window():
     assert agent._wrap_up_choice(0)["function"]["name"] == "record_finding"
 
 
-# --------------------------------------------------------------- H3: one soft refusal per run
+# --------------------------------------------------------------- H3: soft refusals need room
 
 def test_h3_two_different_soft_guards_cannot_refuse_both_final_findings():
     """de456fe: the subject guard refused at two left, the nothing-written guard at one left."""
@@ -244,7 +244,9 @@ def test_h3_two_different_soft_guards_cannot_refuse_both_final_findings():
     assert out["finding"]["outcome"] == "answered", "stored as sent: the soft guards ask, they do not rewrite"
     waived = [e for e in events if e["type"] == "guard_waived"]
     assert [e["guard"] for e in waived] == ["subject", "nothing written"]
-    assert all("subject guard already sent" in e["why"] for e in waived)
+    # The subject guard spent its one send-back at two left; on the last step neither guard has room to ask again.
+    assert [e["why"] for e in waived] == ["this guard already sent a finding back in this run",
+                                          "no room left for what it would ask"]
 
 
 def test_h3_a_hard_refusal_at_two_left_still_leaves_the_last_step_to_the_finding():
@@ -288,6 +290,28 @@ def test_h3_the_one_soft_refusal_is_still_given_while_there_is_room():
     _, out = run(book, llm, "What does WO-2026-00073 block?", max_steps=6)
 
     assert llm.attempts == 2 and out["finding"]["work_order"] == "WO-2026-00073"
+
+
+def test_h3_an_early_subject_refusal_does_not_cost_the_escalation():
+    """Review of the shared send-back: a subject refusal early in a long run waived the escalation guard, and the
+    finding was stored with no handover raised although 17 steps were left. Each soft guard now asks once."""
+    book = _locked()
+    book.tables["WorkOrder"].append(work_order("WO-2026-00116", "draft"))
+    good = finding("WO-2026-00048", outcome="refused", is_late=None, refusal_reason="locked")
+    llm = Obedient(lambda agent, attempt: finding("WO-2026-00116") if attempt == 0 else dict(good),
+                   free=[("diagnose_work_order", {"work_order": "WO-2026-00048"}),
+                         ("propose_reschedule", {"work_order": "WO-2026-00048"}), "record", "record"])
+    events = []
+    agent, out = run(book, llm, "WO-2026-00048 is late. What does it block, and reschedule it.", events,
+                     max_steps=20, escalate_mode=True)
+
+    refusals = [e["result"]["error"] for e in events if e["type"] == "tool" and e["name"] == "record_finding"
+                and isinstance(e["result"], dict) and e["result"].get("error")]
+    assert refusals[0].startswith("the finding is about a work order this run never looked up")
+    assert refusals[1] == "escalation required before recording the finding"
+    assert "escalate" in forced_names(llm), "the handover is still forced while steps are left"
+    assert agent.escalations and out["finding"] is not None and out["finding"]["work_order"] == "WO-2026-00048"
+    assert not [e for e in events if e["type"] == "guard_waived"]
 
 
 # --------------------------------------------------------------- C4: the chain guard asks only what can be done

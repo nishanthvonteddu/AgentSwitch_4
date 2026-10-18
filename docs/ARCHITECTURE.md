@@ -143,10 +143,12 @@ finding off the end of the run.
 the schema forbids, a substituted order, prose for a cause code, an unrecorded cost — and refuse every time,
 because a wrong row is graded as an answer. **Soft** guards ask for a better answer — the subject the run
 looked up, a refusal said out loud when nothing could be written, a reschedule chain finished, the
-escalation raised — and share **one** send-back per run (`_take_soft_refusal()`), given only while there is
-room to act on it: a step for the retry, and for the chain and escalation guards the free steps their
-instruction needs. Warned once *each*, two of them used to refuse the last two forced findings and leave
-nothing filed. A soft guard that is waived lets the finding through as sent and traces `guard_waived`;
+escalation raised — and each sends a finding back at most **once**, and only while there is room to act on it
+(`_take_soft_refusal()`): a step for the retry, and for the chain and escalation guards the free steps their
+instruction needs. Room is what keeps the finding safe: on the last step no soft guard has room, so it always
+stores. Without the room check, two of them used to refuse the last two forced findings and leave nothing
+filed. (One send-back shared by all four was tried and dropped: an early subject refusal then waived a needed
+escalation with many steps still left.) A soft guard that is waived lets the finding through as sent and traces `guard_waived`;
 nothing is invented for it (an escalation never raised stays absent from `escalations`), except that a
 writable reschedule left unapplied is put on record as `not_applied` with the proposal's dates. Only a hard
 refusal on the very last step can still end a run with no finding.

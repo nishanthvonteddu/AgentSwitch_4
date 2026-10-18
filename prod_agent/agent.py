@@ -115,6 +115,13 @@ def _wo_key(ref) -> str | None:
     return f"WO-{m.group(1)}-{int(m.group(2)):05d}" if m else None
 
 
+def _proves_missing(ref) -> bool:
+    """Whether a lookup that found nothing for `ref` proves no such order exists. domain.resolve_work_order matches a
+    number exactly (case aside) and an id exactly, so only a reference in the platform's own form proves absence:
+    "WO-2026-73" not found says nothing about WO-2026-00073, which _wo_key treats as the same order."""
+    return isinstance(ref, str) and bool(ORDER_REF.fullmatch(ref.strip()))
+
+
 def _nulled_required(args: dict) -> list[str]:
     """Required fields the model sent as null where its own schema does not allow null.
 
@@ -470,10 +477,10 @@ class ProductionAgent:
         self._applied: dict[str, dict] = {}   # wo_id -> the write the platform confirmed
         self._conflicted: dict[str, dict] = {}  # wo_id -> a write the platform refused as stale
         self._examined: set[str] = set()      # work orders this run actually looked up, by _order_key
-        # The soft guards (wrong subject, nothing written, chain left half-moved, escalation missing) share one
-        # send-back per run. Warned once EACH, two of them could refuse the forced finding on the last two steps
-        # and end the run with nothing stored, which scores worse than any of the answers they were improving.
-        self._soft_refused: str | None = None  # which soft guard used the run's one send-back
+        # The soft guards (wrong subject, nothing written, chain left half-moved, escalation missing) each send a
+        # finding back at most once, and only with room left to act on it. Room is what protects the finding: they
+        # once refused the forced finding on each of the last two steps and the run ended with nothing stored.
+        self._soft_refused: set[str] = set()  # soft guards that have sent a finding back in this run
         self._escalation_warned = False  # that guard was the escalation one: wrap-up then forces escalate
         self._last_call_given = False
         self._finding_nudged = False
@@ -662,14 +669,18 @@ class ProductionAgent:
                 and not (self._finding_nudged or self._finding_demanded))
 
     def _take_soft_refusal(self, guard: str, room: bool) -> bool:
-        """Whether a soft guard may send this finding back: the first soft refusal in the run, with room for what it
-        asks. Otherwise the finding goes through as sent, which is traced, because nothing stored scores worse."""
-        if self._soft_refused is None and room:
-            self._soft_refused = guard
+        """Whether a soft guard may send this finding back: once per guard, and only with room for what it asks.
+        Otherwise the finding goes through as sent, which is traced, because nothing stored scores worse.
+
+        Room is what keeps the finding safe, not a run-wide allowance: on the last step no guard has room, so that
+        step always stores. One send-back shared by all four guards was tried and dropped: a subject refusal early
+        in a 20-step run then waived the escalation guard, and the finding was stored with no handover raised."""
+        if guard not in self._soft_refused and room:
+            self._soft_refused.add(guard)
             return True
         self.trace({"type": "guard_waived", "guard": guard, "step": self._step,
-                    "why": f"the {self._soft_refused} guard already sent a finding back in this run"
-                    if self._soft_refused else "no room left for what it would ask"})
+                    "why": "this guard already sent a finding back in this run" if guard in self._soft_refused
+                    else "no room left for what it would ask"})
         return False
 
     def _reconcile_rescheduled(self, args: dict) -> dict:
@@ -710,7 +721,7 @@ class ProductionAgent:
             for key in (ref, wo.get("number"), wo.get("id")):
                 if self._order_key(key):
                     self._diagnoses[self._order_key(key)] = diag
-        elif self._order_key(ref):
+        elif self._order_key(ref) and _proves_missing(ref):
             self._missing.add(self._order_key(ref))
         return diag
 
@@ -720,6 +731,11 @@ class ProductionAgent:
         five more steps, ran into its token limit, and filed the forced finding as answered."""
         if not (isinstance(result, dict) and result.get("found") is False and isinstance(ref, str) and ref.strip()):
             return result
+        if not _proves_missing(ref):
+            # Not found as typed, which is not the same as not existing: look it up again in the platform's form.
+            return {**result, "instruction_for_agent": (
+                f"No work order matched {ref!r} as typed. Work-order numbers are WO-YYYY-NNNNN with a five-digit "
+                "sequence (e.g. WO-2026-00073): look it up again in that form before concluding it does not exist.")}
         if self._order_key(ref):
             self._missing.add(self._order_key(ref))
         return {**result, "instruction_for_agent": (
@@ -966,7 +982,8 @@ class ProductionAgent:
 
     def _dispatch(self, name: str, args: dict):
         result = self._dispatch_tool(name, args)
-        if isinstance(result, dict) and result.get("found") is False and self._order_key(args.get("work_order")):
+        if (isinstance(result, dict) and result.get("found") is False and self._order_key(args.get("work_order"))
+                and _proves_missing(args["work_order"])):
             self.missing_orders.add(self._order_key(args["work_order"]))
         self._learn_numbers(result)
         if name != "record_finding":
@@ -1086,7 +1103,7 @@ class ProductionAgent:
     # a null the schema forbids, an order substituted for one that does not exist, prose for a cause code, a cost
     # nobody recorded — and refuses every time: a wrong row is graded as an answer, and storing it is worse than
     # storing nothing. A SOFT guard asks for a better answer — the right subject, a refusal said out loud, a chain
-    # finished, a handover raised — and shares one send-back per run with the others, only while there are steps
+    # finished, a handover raised — and sends a finding back at most once per guard, only while there are steps
     # left to act on it (_take_soft_refusal). The last steps belong to the finding (_wrap_up_choice).
     def _record_finding(self, args: dict):
         if self.finding is not None:
