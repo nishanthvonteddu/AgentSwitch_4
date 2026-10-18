@@ -332,8 +332,16 @@ CHOICE_MODES = ("named", "required", "auto")
 # (keystone_why_late_wo3), was forced to record_finding and answered in prose instead ("Let me escalate"), which
 # ended the run with nothing in the database to grade. A prose reply to that forced call gets this, once.
 FINDING_NUDGE = ("No finding is recorded yet, and only what record_finding stores counts as this run's answer. "
-                 "Call record_finding now with what you have found. If part of it needs a person or a write this "
-                 "seat cannot make, say so in the finding.")
+                 "Call record_finding now with what you have found; no other tool is offered until it is recorded. "
+                 "If part of it needs a person or a write this seat cannot make, say so in the finding.")
+# Added to both asks in a run that cannot escalate: in the 2026-10-18 failures the model kept saying it would
+# escalate first, in runs where no escalate tool exists.
+NO_ESCALATION_NOTE = " Escalation is not available in this run, so do not look for it."
+# Rehearsal 2026-10-18 (deepseek-v4.1-flash through OpenRouter, why_late_wo48_subcontract, twice in four runs): the
+# model answered FINDING_NUDGE in prose again ("I need to escalate first, if available"), and the run ended with no
+# finding. A second prose reply to a forced record_finding gets this, and the step it asks for.
+FINDING_LAST_ASK = ("This is the last step. Call record_finding now, with the causes, records and outcome you have "
+                    "already found. It is the only tool offered, and nothing else you write is kept.")
 
 
 def _choice_rejected(exc: Exception) -> bool:
@@ -483,6 +491,8 @@ class ProductionAgent:
         self._soft_refused: set[str] = set()  # soft guards that have sent a finding back in this run
         self._escalation_warned = False  # that guard was the escalation one: wrap-up then forces escalate
         self._last_call_given = False
+        self._asked_again = False  # a second prose reply to a forced record_finding got FINDING_LAST_ASK
+        self._reask_step = False   # that ask is owed one step, even past the token budget's last call
         self._finding_nudged = False
         self._rejected_finding_args = {}
         self._rejected_subject: str | None = None  # the refused attempt's order, by _order_key
@@ -1446,7 +1456,8 @@ class ProductionAgent:
                 self.trace({"type": "deadline", "step": step})
                 break
             if self.token_budget is not None and self.tokens["total"] >= self.token_budget:
-                if self.finding is None and not self._last_call_given:
+                if self.finding is None and (not self._last_call_given or self._reask_step):
+                    self._reask_step = False
                     # Wrap-up plans room for the forced finding and one retry by the size of the last step, and
                     # steps grow as the history does: a guard that refuses the forced call can leave the retry
                     # over the limit. One more step costs less than a run with nothing in the database to grade.
@@ -1465,6 +1476,11 @@ class ProductionAgent:
                 sampling["tool_choice"] = choice
                 self.trace({"type": "wrap_up", "step": step, "tool_choice": choice})
             tools = self.tool_specs()
+            if isinstance(choice, dict) and choice.get("function", {}).get("name") == "record_finding":
+                # Forced by name, record_finding is the only call the model may make, so it is the only one offered.
+                # A host that does not enforce the name (2026-10-18, OpenRouter) otherwise left the model free to go
+                # looking for an escalate tool this run does not have, twice, and to end with no finding.
+                tools = [t for t in tools if t["function"]["name"] == "record_finding"] or tools
             try:
                 resp = self._complete(step, model=self.model, messages=messages, tools=tools, **sampling)
                 msg = resp.choices[0].message
@@ -1500,8 +1516,16 @@ class ProductionAgent:
                 sent_back = self._finding_nudged or self._finding_demanded
                 if forced and self.finding is None and not sent_back:
                     self._finding_nudged = True
-                    messages.append({"role": "user", "content": FINDING_NUDGE})
+                    note = "" if self.escalate_mode else NO_ESCALATION_NOTE
+                    messages.append({"role": "user", "content": FINDING_NUDGE + note})
                     self.trace({"type": "finding_nudge", "step": step})
+                    continue
+                if forced and self.finding is None and self._finding_nudged and not self._asked_again \
+                        and step < self.max_steps - 1:
+                    self._asked_again = self._reask_step = True
+                    note = "" if self.escalate_mode else NO_ESCALATION_NOTE
+                    messages.append({"role": "user", "content": FINDING_LAST_ASK + note})
+                    self.trace({"type": "finding_nudge", "step": step, "again": True})
                     continue
                 if (self.require_finding and self.finding is None and not sent_back
                         and step < self.max_steps - 1):
