@@ -508,6 +508,7 @@ class ProductionAgent:
         # propose_reschedule does not re-run a diagnosis and a BOM walk the model has already paid for.
         self._reads: dict[tuple[str, str], dict] = {}
         self._diagnoses: dict[str, dict] = {}  # by reference, number and id, each by _order_key
+        self._impacts: dict[str, dict] = {}  # downstream_impact results, keyed like _diagnoses
         self._missing: set[str] = set()  # references a lookup this run proved name no work order, by _order_key
         self._numbers: dict[str, str] = {}  # record id -> its number, from every tool result this run read
         self._unread_lanes: dict[str, str] = {}  # cockpit lane -> the state shop_floor_exceptions said it could not fill
@@ -841,6 +842,68 @@ class ProductionAgent:
                 cited.append(record)
         return {**args, "evidence_records": cited} if cited != (args.get("evidence_records") or []) else args
 
+    def _drop_unproduced_causes(self, args: dict) -> dict:
+        """Remove cause codes the diagnosis of the finding's order does not contain.
+
+        Seen live 2026-10-18 on Suryodaya (s07_false_premise, gemini-3.5-flash-lite): diagnose returned
+        schedule_capacity_ceiling and workstation_downtime_recorded, and the finding named schedule_capacity_ceiling
+        and workstation_v_recorded. The typo has the shape of a code, so _malformed_causes let it through, and
+        _restore_causes then added the real code beside it: the stored finding carried a cause no tool produced.
+        Which causes exist for an order is diagnose's answer, which the loop holds; the model only sorts them.
+
+        Runs after _restore_causes, so it judges against the same diagnosis, including the one _restore_causes reads
+        for an order the model reached without diagnosing, and before _cite_evidence, so a removed code is never
+        given evidence. Only bare codes are judged: prose and wrong shapes stay for the guards to refuse, as before.
+        A finding whose order has no diagnosis (a cockpit answer about no order) keeps its codes untouched.
+        """
+        diag = self._diagnosis_for(args.get("work_order"))
+        if not isinstance(diag, dict) or not diag.get("found"):
+            return args
+        fields = ("blocking_causes", "contributing_causes")
+        if any(args.get(k) is not None and not isinstance(args.get(k), list) for k in fields):
+            return args  # the wrong shape is _mistyped's to refuse
+        produced = {s.get("code") for s in diag.get("signals") or []}
+        fixed, removed = dict(args), {}
+        for field in fields:
+            if not args.get(field):
+                continue
+            unproduced = [c for c in args[field] if isinstance(c, str) and CAUSE_CODE.fullmatch(c) and c not in produced]
+            if unproduced:
+                removed[field] = unproduced
+                fixed[field] = [c for c in args[field] if c not in unproduced]
+        if not removed:
+            return args
+        self.trace({"type": "finding_corrected", "work_order": args.get("work_order"), "removed": removed,
+                    "signals": sorted(c for c in produced if c),
+                    "why": "cause codes that are not signals in this order's diagnosis were removed"})
+        return fixed
+
+    def _impact_from_tool(self, args: dict) -> dict:
+        """File customer_impact as downstream_impact returned it for the finding's order, or not at all.
+
+        Seen live 2026-10-18 on Suryodaya (s09_refuse_close): the run never called downstream_impact, and the finding
+        said customer_impact "none linked" while listing SO-2026-00041 in blocked_sales_orders, a false all-clear,
+        the one thing downstream_impact's wording exists to prevent. Other runs that day typed "none". The value is
+        the tool's (the schema says verbatim), and the loop holds it, as it holds the writes _reconcile_rescheduled
+        files: with a result for this order it replaces what was typed; without one, the typed value is dropped.
+        A value of the wrong shape with no result to replace it is left for _mistyped to refuse.
+        """
+        key = self._order_key(args.get("work_order"))
+        impact = self._impacts.get(key) if key else None
+        given = args.get("customer_impact")
+        if isinstance(impact, dict) and isinstance(impact.get("customer_impact"), str):
+            truth = impact["customer_impact"]
+            if given == truth:
+                return args
+            self.trace({"type": "finding_corrected", "work_order": args.get("work_order"), "customer_impact_given": given,
+                        "customer_impact_recorded": truth, "why": "customer_impact filed as downstream_impact returned it"})
+            return {**args, "customer_impact": truth}
+        if "customer_impact" not in args or not isinstance(given, str):
+            return args
+        self.trace({"type": "finding_corrected", "work_order": args.get("work_order"), "customer_impact_removed": given,
+                    "why": "no downstream_impact result for this order in this run, so no customer impact is on record"})
+        return {k: v for k, v in args.items() if k != "customer_impact"}
+
     def _learn_numbers(self, value, depth: int = 0) -> None:
         """Remember the number of every record a tool result gave beside its id, for _numbers_not_ids."""
         if depth > 8:  # tool results nest a few levels; a deeper one is not a record list
@@ -1011,6 +1074,11 @@ class ProductionAgent:
             return self._say_missing(ref, self._diagnose(ref))
         if name == "downstream_impact":
             self._reads["downstream", ref] = result = domain.downstream_impact(self.mcp, ref)
+            if isinstance(result, dict) and result.get("found"):
+                wo = result.get("work_order") or {}
+                for key in (ref, wo.get("number"), wo.get("id")):
+                    if self._order_key(key):
+                        self._impacts[self._order_key(key)] = result
             return self._say_missing(ref, result)
         if name == "propose_reschedule":
             diag = self._diagnose(ref)
@@ -1146,7 +1214,9 @@ class ProductionAgent:
                                "potentially_blocked_work_orders, not work_order."},
                 blame=("work_order",))
         args = self._reconcile_rescheduled(args)
+        args = self._impact_from_tool(args)
         args = self._restore_causes(args)
+        args = self._drop_unproduced_causes(args)
         args = self._cite_evidence(args)
         args = self._restore_unread_lanes(args)
         args = self._refuse_missing_order(args)

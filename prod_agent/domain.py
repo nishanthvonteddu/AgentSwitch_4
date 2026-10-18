@@ -581,6 +581,14 @@ def propose_reschedule(mcp: McpClient, ref: str, diag: dict | None = None, down:
             why[tnum] = f"{tnum} is in progress and its finish date is not known"
     elif undated:
         proposals.append(proposal(target, None, None, "blocked by an event with no known date", commit_ok=False))
+    elif diag.get("is_late") is False:
+        # Seen live 2026-10-18 on Suryodaya (s07_false_premise): WO-2026-00122, not started and due 2027-06-12,
+        # was proposed to start today and finish 2026-10-22, eight months EARLIER, because the branch below moves
+        # any unblocked order to its earliest start. An order that is not late has nothing to recover, so its own
+        # dates stand, and its planned end is what anything waiting on it must follow.
+        target_end = _date(target.get("planned_end_date"))
+        if target_end is None:
+            why[tnum] = f"{tnum} has no planned end date"
     else:
         new_start = max([today] + [d for d in ready_dates if d])
         new_end = new_start + duration(target)
@@ -952,21 +960,62 @@ def resolve_item(mcp: McpClient, ref: str) -> dict | None:
     what the caller means and `search` semantics are the platform's to change. Names are unique on
     both books (checked 2026-09-29), so a name is as safe a key as a code here.
     """
+    return _lookup_item(mcp, ref)[0]
+
+
+ITEM_CANDIDATES_MAX = 5       # near matches offered when nothing matches exactly: a short list, never a pick
+ITEM_CANDIDATE_MIN_CHARS = 3  # shorter text is part of too many names and codes to narrow anything
+
+
+def _lookup_item(mcp: McpClient, ref: str) -> tuple[dict | None, list[dict], int]:
+    """resolve_item's exact match; failing that, the items whose name or code contains `ref`, and how many there were.
+
+    The near matches come from the same read as the exact match, so a miss costs no extra call. They are offered,
+    never chosen: "Hex Bolt" is part of both M8x25 and M8x30, and which one was meant is the user's to say.
+    """
     ref = (ref or "").strip()
     if not ref:
-        return None
+        return None, [], 0
     if UUID_RE.match(ref):
         try:
-            return mcp.call("Item.get", {"id": ref})
+            return mcp.call("Item.get", {"id": ref}), [], 0
         except McpError as e:
             if e.kind == "not_found" or "not found" in e.message.lower():
-                return None
+                return None, [], 0  # a mistyped id is part of no name or code, so there is nothing to offer
             raise
     wanted = ref.casefold()
+    near = []
     for item in mcp.list_all("Item"):
         if any((item.get(f) or "").strip().casefold() == wanted for f in ("code", "number", "name")):
-            return item
-    return None
+            return item, [], 0
+        if len(wanted) >= ITEM_CANDIDATE_MIN_CHARS and any(wanted in (item.get(f) or "").casefold()
+                                                           for f in ("name", "code")):
+            near.append({k: item.get(k) for k in ("id", "number", "code", "name")})
+    return None, near[:ITEM_CANDIDATES_MAX], len(near)
+
+
+def _item_or_miss(mcp: McpClient, item: str) -> tuple[dict | None, dict | None]:
+    """The item `item` names, or else the not-found answer to return in its place.
+
+    Seen live 2026-10-18 on Keystone (s10_by_item_name, gemini-3.5-flash-lite): asked about "the Cab Step Frame
+    job", find_orders_for_item("Cab Step Frame") found nothing, because the item is "Cab Step Frame, powder
+    coated", and the model spent five steps paging Item rows through query_records before calling again with
+    ITEM-2026-00019. Resolution stays exact; a miss now names the items the text is part of, so the next call can
+    be exact, or the user can be asked.
+    """
+    found, near, total = _lookup_item(mcp, item)
+    if found:
+        return found, None
+    miss = {"found": False, "item": item, "detail": "no item with that id, code, number or exact name"}
+    if near:
+        miss["candidates"] = near
+        if total > len(near):
+            miss["candidates_total"] = total
+        miss["instruction_for_agent"] = (
+            "Nothing matched exactly, so no item was chosen. The candidates' names or codes contain the text given. "
+            "If one of them is plainly the item meant, call this tool again with its exact number; if several "
+            "could be, ask the user which one. Never pick one by guessing, and do not search Item rows instead.")
+    return None, miss
 
 
 def where_is_item_used(mcp: McpClient, item: str) -> dict:
@@ -981,10 +1030,9 @@ def where_is_item_used(mcp: McpClient, item: str) -> dict:
     Consumed and produced are reported separately on purpose. "Which BOMs use this item" was answered
     with the BOM that makes it, which is the opposite relationship.
     """
-    found = resolve_item(mcp, item)
-    if not found:
-        return {"found": False, "item": item,
-                "detail": "no item with that id, code, number or exact name"}
+    found, miss = _item_or_miss(mcp, item)
+    if miss:
+        return miss
     if not mcp.has_tool("BOM.list"):
         return {"found": True, "item": _item_summary(found),
                 **seat_capability(mcp, "BOM.list"), "error": "BOM not readable by this seat"}
@@ -1032,9 +1080,9 @@ def find_orders_for_item(mcp: McpClient, item: str) -> dict:
     page is far more likely to show a finished order than the live one. `.list` filters on item_id and
     on a status list at the server, so this is one narrow read and the closed orders never reach the model.
     """
-    found = resolve_item(mcp, item)
-    if not found:
-        return {"found": False, "item": item, "detail": "no item with that id, code, number or exact name"}
+    found, miss = _item_or_miss(mcp, item)
+    if miss:
+        return miss
     today = config.today()
     sched = {o["work_order_id"]: o for o in finite_schedule(mcp).get("orders", [])}
     every = mcp.list_all("WorkOrder", item_id=found["id"])
