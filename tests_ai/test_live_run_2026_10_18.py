@@ -1,4 +1,4 @@
-"""AI-WRITTEN REGRESSION TESTS (written by Claude, 2026-10-18).
+"""AI-WRITTEN REGRESSION TESTS (2026-10-18).
 
 These are NOT the team's hand-written tests and must not be claimed as such: the course scores
 AI-written tests at zero.
