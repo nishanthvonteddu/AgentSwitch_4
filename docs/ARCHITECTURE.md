@@ -121,7 +121,7 @@ something went wrong live.
 |---|---|---|
 | must file a finding | `record_finding` required before the final answer | a run that concludes only in prose |
 | repeat guard | `REPEAT_GUARDED` | the loop burning steps; we saw 9 identical `seat_capability` calls |
-| forced wrap-up | `_wrap_up_choice()` | running out of steps with nothing recorded — at 2 steps left `record_finding` is forced; at 3, a due escalation |
+| forced wrap-up | `_wrap_up_choice()` | running out of steps with nothing recorded — at 2 steps left `record_finding` is forced; at 3, a due escalation (never later: the last steps, the token budget's last call and the deadline's wrap-up window belong to the finding) |
 | three locks on writes | `apply_mode` + `allowed_write_ids` + `approve()` | writing to a row we do not own |
 | re-read before write | `apply_proposal` → `changed_underneath` | overwriting somebody's edit |
 | conflict stops everything | `self.conflicts` | retrying into a race |
@@ -129,11 +129,27 @@ something went wrong live.
 | a failed escalation is still an escalation | `except` in `_dispatch("escalate")` | the rule below refusing every later call, so the run ends with nothing filed |
 | costs must be real | cost check in `record_finding` | computing a variance when no cost was recorded |
 | no null where the schema forbids null | `_nulled_required()` in `record_finding` | filing a finding the model left half-built, and calling the run a success |
+| every field in its declared shape | `_mistyped()` in `record_finding` | a value of the wrong type, outside its enum, or an entry missing a required key reaching the verifier |
+| never a substituted order | `requested_orders` / `missing_orders` in `record_finding` | answering about a "closest" order (or about none) when the order asked for does not exist |
 
 The escalation rule is worth reading twice: if `needs_person` is non-empty and nothing was escalated,
-the first `record_finding` is **refused** and the model is told to escalate first. It is refused once only,
-because a second refusal can end the run with nothing filed; instead, once that refusal has been seen,
-`_wrap_up_choice()` forces the `escalate` call on the next step. A handover is not optional.
+the first `record_finding` is **refused** and the model is told to escalate first; once that refusal has been
+seen, `_wrap_up_choice()` forces the `escalate` call on the next step. A handover matters, but not more than
+the finding: escalate is only forced while three steps remain (escalate, `record_finding`, one retry) and
+outside the finding's own time and token wrap-up, so a `needs_person` found late can no longer push the
+finding off the end of the run.
+
+`record_finding`'s guards come in two kinds. **Hard** guards keep wrong data out — the wrong shape, a null
+the schema forbids, a substituted order, prose for a cause code, an unrecorded cost — and refuse every time,
+because a wrong row is graded as an answer. **Soft** guards ask for a better answer — the subject the run
+looked up, a refusal said out loud when nothing could be written, a reschedule chain finished, the
+escalation raised — and share **one** send-back per run (`_take_soft_refusal()`), given only while there is
+room to act on it: a step for the retry, and for the chain and escalation guards the free steps their
+instruction needs. Warned once *each*, two of them used to refuse the last two forced findings and leave
+nothing filed. A soft guard that is waived lets the finding through as sent and traces `guard_waived`;
+nothing is invented for it (an escalation never raised stays absent from `escalations`), except that a
+writable reschedule left unapplied is put on record as `not_applied` with the proposal's dates. Only a hard
+refusal on the very last step can still end a run with no finding.
 
 That rule is also why a throwing `escalate` has to leave a record behind. If `open_agent_session` or
 `raise_escalation` raises, the failure is appended to `self.escalations` as `reason_code:
