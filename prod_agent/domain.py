@@ -10,9 +10,16 @@ import re
 from . import config
 from .mcp_client import McpClient, McpError
 
+# Drafts count as open, and so as late once past their planned end, on purpose. The platform's own late query and
+# dashboard leave drafts out (status in not_started, in_progress, stopped), but a past-due draft is still an order
+# nobody has released, and the harness's own late orders are exactly that (fixtures.late_draft_chain, the
+# complex_planted_instruction target). diagnose pairs it with the not_released signal, so the answer says the late
+# order is an unreleased draft rather than presenting it as running behind on the floor.
 OPEN_WO = {"draft", "not_started", "in_progress", "stopped"}
 OPEN_MR = {"draft", "submitted", "partially_ordered", "ordered"}
 DONE_SCO = {"completed", "cancelled"}
+
+
 def _csv(statuses: set[str]) -> str:
     """`.list` reads a comma-separated value as OR, so a status set narrows at the server.
 
@@ -26,9 +33,11 @@ def _csv(statuses: set[str]) -> str:
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
+# Every component of the order reported 0 available, so whether stock is short could not be confirmed.
+STOCK_UNVERIFIED = "stock_unverified"
 # Signals whose ready date is unknown: no reschedule date can honestly be committed.
 UNDATED_BLOCKERS = {
-    "subcontract_not_sent", "subcontract_overdue", "material_shortage",
+    "subcontract_not_sent", "subcontract_overdue", "material_shortage", STOCK_UNVERIFIED,
     "quality_rejected", "workstation_unavailable",
     "engineering_change_pending", "workstation_breakdown_active",
 }
@@ -254,8 +263,18 @@ def diagnose(mcp: McpClient, ref: str) -> dict:
         expected = _date(sco.get("expected_delivery_date"))
         detail = {"status": sco.get("status"), "expected_delivery_date": _iso(expected),
                   "vendor": sco.get("_vendor_id_display") or sco.get("vendor_id")}
+        # SubcontractOrderFlow (docs/ENTITY_MAP.md): draft -> submitted -> materials_sent -> in_progress -> received ->
+        # quality_check -> completed, or received -> completed. From received on the goods are back with us, so a
+        # past expected_delivery_date no longer means the vendor is late, and neither stage blocks.
         if sco.get("status") == "draft":
             sig("subcontract_not_sent", sco.get("number"), **detail)
+        elif sco.get("status") == "received":
+            sig("subcontract_received", sco.get("number"), **detail,
+                note="the goods are back from the vendor; the subcontract order is not yet completed")
+        elif sco.get("status") == "quality_check":
+            # expected_delivery_date is the only date the subcontract records; nothing says when inspection ends.
+            sig("subcontract_in_inspection", sco.get("number"), **detail,
+                note="the goods are back from the vendor and in inspection; no inspection finish date is recorded")
         elif expected and expected < today:
             sig("subcontract_overdue", sco.get("number"), **detail)
         else:
@@ -273,12 +292,23 @@ def diagnose(mcp: McpClient, ref: str) -> dict:
     try:
         stock = mcp.call("endpoint.manufacturing.check_stock_availability", {"work_order_id": wid})
         items = stock.get("result", stock).get("items", [])
-        for it in items:
-            if (it.get("shortage") or 0) > 0:
+        short = [it for it in items if (it.get("shortage") or 0) > 0]
+        # Every component reading 0 available has been treated here as a known platform defect, and it may since have
+        # been fixed; either way an all-zero answer cannot be told from a genuinely empty store. So it is decided
+        # from each response, never from a flag: when every component reads 0, stock is unconfirmed and blocks a
+        # date until checked, rather than being reported as short. Once the team confirms the defect fixed, make
+        # this `all_zero = False` and every short line is a material_shortage again.
+        all_zero = bool(items) and all((it.get("available") or 0) == 0 for it in items)
+        if all_zero and short:
+            sig(STOCK_UNVERIFIED, None,
+                items=[{"item_id": it.get("item_id"), "required": it.get("required"), "available": it.get("available"),
+                        "shortage": it.get("shortage"), "critical": it.get("is_critical")} for it in short],
+                note="every component reports 0 available, so stock could not be confirmed: this may be the "
+                     "platform's known always-0 defect or a genuinely empty store; check stock before committing a date")
+        else:
+            for it in short:
                 sig("material_shortage", it.get("item_id"), required=it.get("required"),
                     available=it.get("available"), shortage=it.get("shortage"), critical=it.get("is_critical"))
-        if items and all((it.get("available") or 0) == 0 for it in items):
-            sig("stock_check_unreliable", None, note="every component reports 0 available (known platform defect)")
     except McpError as e:
         sig("stock_check_failed", None, error=e.message)
 
@@ -432,13 +462,18 @@ def downstream_impact(mcp: McpClient, ref: str, max_depth: int = 3) -> dict:
     for w in [_wo_summary(wo)] + blocked:
         if w.get("sales_order_id"):
             so_ids.setdefault(w["sales_order_id"], w["number"])
+    # A WorkOrder row carries its sales order's number as _sales_order_id_display, which names a sales order the
+    # seat then fails to read better than its id does.
+    walked = [wo, *(w for rows in consumers.values() for w in rows if w["id"] in visited)]
+    so_labels = {w["sales_order_id"]: w["_sales_order_id_display"] for w in walked
+                 if w.get("sales_order_id") and w.get("_sales_order_id_display")}
     target_number = wo.get("number")
 
     chain = [_wo_summary(wo)] + blocked
     unlinked_mto = [w["number"] for w in chain if w.get("production_strategy") == "make_to_order" and not w.get("sales_order_id")]
     so_visible = mcp.has_tool("SalesOrder.get")
 
-    sales_orders, not_visible = [], []
+    sales_orders, not_visible, unread = [], [], []
     if not so_visible:
         not_visible.append("SalesOrder: tool_not_in_seat_catalogue (customer impact cannot be determined)")
     elif so_ids:
@@ -447,6 +482,8 @@ def downstream_impact(mcp: McpClient, ref: str, max_depth: int = 3) -> dict:
                 so = mcp.call("SalesOrder.get", {"id": so_id})
             except McpError as e:
                 not_visible.append(f"SalesOrder {so_id}: {e.kind}")
+                label = f"{so_labels[so_id]} (id {so_id})" if so_id in so_labels else so_id
+                unread.append(f"{label} via {via}: {e.kind}")
                 continue
             sales_orders.append({
                 "id": so_id, "number": so.get("number"), "customer": so.get("_party_id_display") or so.get("party_id"),
@@ -456,10 +493,19 @@ def downstream_impact(mcp: McpClient, ref: str, max_depth: int = 3) -> dict:
                 "link": "sales_order_id", "confidence": "linked" if via == target_number else "potential",
             })
 
+    # A sales order the seat failed to read is linked exposure of unknown size, never an absence of exposure: with
+    # every read failing this used to fall through to "none linked", which the prompt lets the model read as no
+    # customer affected. Each cause of doubt is its own "; "-separated part, so none hides another.
+    mto_part = f"make-to-order without a linked sales order: {', '.join(unlinked_mto)}" if unlinked_mto else None
+    unread_part = f"could not read {'; '.join(unread)}" if unread else None
     if not so_visible:
         customer_impact = "undeterminable: sales orders are not visible to this seat"
-    elif unlinked_mto:
-        customer_impact = f"partly unknown: make-to-order without a linked sales order: {', '.join(unlinked_mto)}"
+    elif unread and not sales_orders:
+        customer_impact = "unknown: " + "; ".join(p for p in (unread_part, mto_part) if p)
+    elif unread or unlinked_mto:
+        read = [f"{s['number'] or s['id']} via {s['via_work_order']}" for s in sales_orders]
+        read_part = f"read {', '.join(read)}" if read and unread else None
+        customer_impact = "partly unknown: " + "; ".join(p for p in (mto_part, read_part, unread_part) if p)
     elif sales_orders:
         customer_impact = "known"
     else:
@@ -491,9 +537,11 @@ def propose_reschedule(mcp: McpClient, ref: str, diag: dict | None = None, down:
 
     undated = [s for s in diag["signals"] if s["blocking"]]
     ready_dates = [_date(s["ready_date"]) for s in diag["signals"] if s.get("ready_date")]
+    undated_codes = ", ".join(sorted({s["code"] for s in undated}))
     proposals = []
 
-    def proposal(w, new_start, new_end, reason, commit_ok=True):
+    def proposal(w, new_start, new_end, reason, commit_ok=True, why_undated=None):
+        """why_undated says what stops the date when commit_ok is False; it defaults to the target's blockers."""
         writable = w["status"] == "draft"
         return {
             "work_order_id": w["id"], "number": w["number"], "status": w["status"],
@@ -502,7 +550,7 @@ def propose_reschedule(mcp: McpClient, ref: str, diag: dict | None = None, down:
             "date_committable": commit_ok,
             "writable_by_seat": writable and commit_ok,
             "why_not_writable": None if writable and commit_ok else (
-                "no committable date: " + ", ".join(sorted({s['code'] for s in undated})) if not commit_ok
+                f"no committable date: {why_undated or undated_codes or reason}" if not commit_ok
                 else f"status '{w['status']}': dates are locked after submit; changing them needs an admin cancel"),
             "snapshot_updated_at": w["updated_at"],
         }
@@ -511,39 +559,82 @@ def propose_reschedule(mcp: McpClient, ref: str, diag: dict | None = None, down:
         s, e = _date(w["planned_start_date"]), _date(w["planned_end_date"])
         return dt.timedelta(days=max((e - s).days, 1) if s and e else 1)
 
-    target_end = None
-    if target["status"] in ("in_progress", "completed", "cancelled"):
-        pass  # already running or closed; nothing to move for the target itself
+    # Per upstream number: its end date for the orders that wait on it, or, when it has none, what a dependant is
+    # told (`waits`) and why no date can be committed (`why`). A closed upstream is in `unconstrained`: it blocks
+    # nothing, so its dependants keep their own dates and pass those on.
+    tnum = target["number"]
+    target_end, unconstrained = None, set()
+    waits = {tnum: f"waits on {tnum}, whose date cannot be committed"}
+    why = {tnum: undated_codes}
+    projected = _date(diag["schedule"].get("projected_finish"))
+    if target["status"] in ("completed", "cancelled"):
+        unconstrained.add(tnum)
+    elif target["status"] == "in_progress":
+        # Nothing to move for the target itself: it is already running.
+        if undated:
+            # finite_schedule's projection does not know about a blocker with no date, so it cannot carry one.
+            waits[tnum] = f"waits on {tnum}, which is in progress and blocked with no known ready date"
+        elif projected:
+            target_end = max(projected, today)
+        else:
+            waits[tnum] = f"waits on {tnum}, which is in progress; its finish date is not known"
+            why[tnum] = f"{tnum} is in progress and its finish date is not known"
     elif undated:
         proposals.append(proposal(target, None, None, "blocked by an event with no known date", commit_ok=False))
+    elif diag.get("is_late") is False:
+        # Seen live 2026-10-18 on Suryodaya (s07_false_premise): WO-2026-00122, not started and due 2027-06-12,
+        # was proposed to start today and finish 2026-10-22, eight months EARLIER, because the branch below moves
+        # any unblocked order to its earliest start. An order that is not late has nothing to recover, so its own
+        # dates stand, and its planned end is what anything waiting on it must follow.
+        target_end = _date(target.get("planned_end_date"))
+        if target_end is None:
+            why[tnum] = f"{tnum} has no planned end date"
     else:
         new_start = max([today] + [d for d in ready_dates if d])
         new_end = new_start + duration(target)
-        projected = _date(diag["schedule"].get("projected_finish"))
         if projected and projected > new_end:
             new_end = projected
         target_end = new_end
         if (_iso(new_start), _iso(new_end)) != (target["planned_start_date"], target["planned_end_date"]):
             proposals.append(proposal(target, new_start, new_end, "earliest start after known blockers; finish from finite schedule"))
 
-    upstream_end = {target["number"]: target_end}
+    upstream_end = {tnum: target_end}
     for w in down["potentially_blocked_work_orders"]:
-        parent_end = upstream_end.get(w["consumes_output_of"])
+        num, parent = w["number"], w["consumes_output_of"]
         if w["status"] in ("in_progress", "stopped"):
-            upstream_end[w["number"]] = None
+            state = w["status"].replace("_", " ")
+            upstream_end[num] = None
+            waits[num] = f"waits on {num}, which is {state}; its finish date is not known"
+            why[num] = f"{num} is {state} and its finish date is not known"
+            continue
+        parent_end, start = upstream_end.get(parent), _date(w["planned_start_date"])
+        if parent in unconstrained or (parent_end is not None and start and start > parent_end):
+            # Nothing to move: the upstream is closed, or this order already starts after it. Its own planned end is
+            # what anything waiting on it must follow.
+            upstream_end[num] = _date(w["planned_end_date"])
+            if upstream_end[num] is None:
+                why[num] = f"{num} has no planned end date"
             continue
         if parent_end is None:
-            proposals.append(proposal(w, None, None, f"waits on {w['consumes_output_of']}, whose date cannot be committed", commit_ok=False))
-            upstream_end[w["number"]] = None
-            continue
-        start = _date(w["planned_start_date"])
-        if start and start > parent_end:
-            upstream_end[w["number"]] = _date(w["planned_end_date"])
+            why[num] = why.get(parent) or f"{parent} has no committable date"
+            proposals.append(proposal(w, None, None, waits.get(parent) or f"waits on {parent}, whose date cannot be committed",
+                                      commit_ok=False, why_undated=why[num]))
+            upstream_end[num] = None
+            waits[num] = f"waits on {num}, whose date cannot be committed"
             continue
         new_start = parent_end + dt.timedelta(days=1)
         new_end = new_start + duration(w)
-        upstream_end[w["number"]] = new_end
-        proposals.append(proposal(w, new_start, new_end, f"must start after {w['consumes_output_of']} finishes"))
+        upstream_end[num] = new_end
+        reason = f"must start after {parent} finishes"
+        if parent == tnum and target["status"] == "in_progress":
+            # Say whose date it is. A projection already past is not the platform's date for the dependant: the plan
+            # then counts from today, and the person approving the write must see that, not today labelled as its.
+            if projected < today:
+                reason += (f" (the platform projected {tnum} to finish {_iso(projected)}, already past, so this "
+                           f"counts from today, {_iso(today)})")
+            else:
+                reason += f" (date from the platform's projected finish for {tnum}, {_iso(projected)})"
+        proposals.append(proposal(w, new_start, new_end, reason))
 
     return {"found": True, "work_order": target, "today": _iso(today), "proposals": proposals,
             "downstream_considered": [b["number"] for b in down["potentially_blocked_work_orders"]]}
@@ -699,12 +790,18 @@ def order_feasible_by(mcp: McpClient, ref: str, due: str) -> dict:
     outlook = capacity_outlook(mcp)
     days = (target - today).days
 
-    if blocking:
+    if set(blocking) - {STOCK_UNVERIFIED}:
         # An undated blocker is the honest stop: no arithmetic can promise a date behind it.
         verdict = "no"
         reason = f"blocked with no known ready date: {', '.join(blocking)}"
     elif days < 0:
         verdict, reason = "no", f"the date asked for ({due}) is already past"
+    elif blocking:
+        # Only the stock check stands in the way, and an all-zero answer may be the platform's defect rather than an
+        # empty store: "no" would rest on data that could not be confirmed, so the answer is that nobody knows yet.
+        verdict = "unknown"
+        reason = ("stock could not be confirmed: every component reports 0 available, which may be the platform's "
+                  "known always-0 defect or a genuinely empty store; check stock before committing to this date")
     elif not cards:
         verdict, reason = "unknown", "no open job cards on this order, so there is no work content to size"
     else:
@@ -863,21 +960,77 @@ def resolve_item(mcp: McpClient, ref: str) -> dict | None:
     what the caller means and `search` semantics are the platform's to change. Names are unique on
     both books (checked 2026-09-29), so a name is as safe a key as a code here.
     """
+    return _lookup_item(mcp, ref)[0]
+
+
+ITEM_CANDIDATES_MAX = 5       # near matches offered when nothing matches exactly: a short list, never a pick
+ITEM_CANDIDATE_MIN_CHARS = 3  # shorter text is part of too many names and codes to narrow anything
+
+
+def _lookup_item(mcp: McpClient, ref: str) -> tuple[dict | None, list[dict], int]:
+    """resolve_item's exact match; failing that, the items whose name or code contains `ref`, and how many there were.
+
+    The near matches come from the same read as the exact match, so a miss costs no extra call. They are offered,
+    never chosen: "Hex Bolt" is part of both M8x25 and M8x30, and which one was meant is the user's to say.
+    """
     ref = (ref or "").strip()
     if not ref:
-        return None
+        return None, [], 0
     if UUID_RE.match(ref):
         try:
-            return mcp.call("Item.get", {"id": ref})
+            return mcp.call("Item.get", {"id": ref}), [], 0
         except McpError as e:
             if e.kind == "not_found" or "not found" in e.message.lower():
-                return None
+                return None, [], 0  # a mistyped id is part of no name or code, so there is nothing to offer
             raise
     wanted = ref.casefold()
+    near = []
     for item in mcp.list_all("Item"):
         if any((item.get(f) or "").strip().casefold() == wanted for f in ("code", "number", "name")):
-            return item
-    return None
+            return item, [], 0
+        if len(wanted) >= ITEM_CANDIDATE_MIN_CHARS and any(wanted in (item.get(f) or "").casefold()
+                                                           for f in ("name", "code")):
+            near.append({k: item.get(k) for k in ("id", "number", "code", "name")})
+    return None, near[:ITEM_CANDIDATES_MAX], len(near)
+
+
+# An item number as the platform issues it (ITEM-2026-00019): structural, never typed prose, so it is safe to put
+# inside an instruction the model is meant to follow.
+ITEM_NUMBER_RE = re.compile(r"^[A-Z]+-\d{4}-\d{3,6}$")
+
+
+def _item_or_miss(mcp: McpClient, item: str, tool: str) -> tuple[dict | None, dict | None]:
+    """The item `item` names, or else the not-found answer to return in its place.
+
+    Seen live 2026-10-18 on Keystone (s10_by_item_name, gemini-3.5-flash-lite): asked about "the Cab Step Frame
+    job", find_orders_for_item("Cab Step Frame") found nothing, because the item is "Cab Step Frame, powder
+    coated", and the model spent five steps paging Item rows through query_records before calling again with
+    ITEM-2026-00019. Resolution stays exact; a miss now names the items the text is part of, so the next call can
+    be exact, or the user can be asked.
+    """
+    found, near, total = _lookup_item(mcp, item)
+    if found:
+        return found, None
+    miss = {"found": False, "item": item, "detail": "no item with that id, code, number or exact name"}
+    if near:
+        miss["candidates"] = near
+        if total > len(near):
+            miss["candidates_total"] = total
+        only = near[0].get("number") if len(near) == 1 and total == 1 else None
+        if isinstance(only, str) and ITEM_NUMBER_RE.match(only):
+            # Seen live 2026-10-18 again, after candidates were added: one candidate, a conditional instruction,
+            # and the model still paged Item rows for nine more steps. A concrete next call is followed; it is
+            # still the model's call to make, and it names the item by number only, never by its typed name.
+            miss["instruction_for_agent"] = (
+                f"No item has exactly that name, but exactly one item contains it: {only}. If that is the item "
+                f"meant, your next call is {tool} with item \"{only}\". Do not search Item rows.")
+        else:
+            miss["instruction_for_agent"] = (
+                "Nothing matched exactly, so no item was chosen. The candidates' names or codes contain the text "
+                "given. If one of them is plainly the item meant, call this tool again with its exact number; if "
+                "several could be, ask the user which one. Never pick one by guessing, and do not search Item rows "
+                "instead.")
+    return None, miss
 
 
 def where_is_item_used(mcp: McpClient, item: str) -> dict:
@@ -892,10 +1045,9 @@ def where_is_item_used(mcp: McpClient, item: str) -> dict:
     Consumed and produced are reported separately on purpose. "Which BOMs use this item" was answered
     with the BOM that makes it, which is the opposite relationship.
     """
-    found = resolve_item(mcp, item)
-    if not found:
-        return {"found": False, "item": item,
-                "detail": "no item with that id, code, number or exact name"}
+    found, miss = _item_or_miss(mcp, item, "where_is_item_used")
+    if miss:
+        return miss
     if not mcp.has_tool("BOM.list"):
         return {"found": True, "item": _item_summary(found),
                 **seat_capability(mcp, "BOM.list"), "error": "BOM not readable by this seat"}
@@ -943,9 +1095,9 @@ def find_orders_for_item(mcp: McpClient, item: str) -> dict:
     page is far more likely to show a finished order than the live one. `.list` filters on item_id and
     on a status list at the server, so this is one narrow read and the closed orders never reach the model.
     """
-    found = resolve_item(mcp, item)
-    if not found:
-        return {"found": False, "item": item, "detail": "no item with that id, code, number or exact name"}
+    found, miss = _item_or_miss(mcp, item, "find_orders_for_item")
+    if miss:
+        return miss
     today = config.today()
     sched = {o["work_order_id"]: o for o in finite_schedule(mcp).get("orders", [])}
     every = mcp.list_all("WorkOrder", item_id=found["id"])

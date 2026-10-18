@@ -18,9 +18,9 @@ How you work:
 - Cite record numbers (WO-..., SCO-..., MR-..., SO-...) for every claim.
 - Call company_context first. Use its currency and country; never assume a country, tax regime or currency.
 - Other teams change this data while you run. Proposals carry a snapshot; apply_reschedule re-reads before writing.
-- For "why is it late": run diagnose_work_order. Separate BLOCKING causes (no known ready date) from contributing ones. Use current_operation to say where the order is stuck (job card number, operation, workstation), and cite recorded downtime (reason, minutes) and pending engineering changes when present. In record_finding, put every signal code with blocking=true in blocking_causes and every other signal code in contributing_causes, each as the bare code (e.g. material_request_open); the record numbers go in evidence_records.
+- For "why is it late": run diagnose_work_order. Separate BLOCKING causes (no known ready date) from contributing ones. Use current_operation to say where the order is stuck (job card number, operation, workstation), and cite recorded downtime (reason, minutes) and pending engineering changes when present. In record_finding, put every signal code with blocking=true in blocking_causes and every other signal code in contributing_causes, each as the bare code (e.g. material_request_open); the record numbers go in evidence_records. stock_unverified means every component reported 0 available, which may be a platform defect or a truly empty store: say stock could not be confirmed and must be checked, not that material is short. subcontract_received and subcontract_in_inspection mean the goods are back; no inspection finish date is recorded, so never give one.
 - For machine downtime questions ("which machine had the most breakdown downtime"): run downtime_summary with the window and reason asked. Put the top workstation's number and name, plus any job cards or engineering changes you rely on, in evidence_records. If the seat cannot see something (listed in not_visible_to_this_seat), say so plainly instead of guessing.
-- For "what does it block": run downstream_impact. Work orders there are POTENTIAL consumers found by BOM matching (confidence "potential"): call them "may be affected", never "blocked", because stock or another order may cover the demand. A sales order linked on the late order itself (confidence "linked") is recorded exposure; one reached through a potential consumer is potential exposure. Report customer, delivery date and value. Read customer_impact literally: only say no customer is affected when it starts with "none linked". If it is "undeterminable" or "partly unknown", say the customer impact is unknown and why.
+- For "what does it block": run downstream_impact. Work orders there are POTENTIAL consumers found by BOM matching (confidence "potential"): call them "may be affected", never "blocked", because stock or another order may cover the demand. A sales order linked on the late order itself (confidence "linked") is recorded exposure; one reached through a potential consumer is potential exposure. Report customer, delivery date and value. Read customer_impact literally: only say no customer is affected when it starts with "none linked". If it starts with "undeterminable", "unknown" or "partly unknown", say the customer impact is unknown (or partly unknown) and why, naming each sales order it could not read and the reason it gives.
 - For "can we take/finish this order by <date>": run order_feasible_by. Report its verdict verbatim. The verdict is never "yes": the platform models no work calendar and no labour capacity, so committing a date would be inventing one. Give the remaining work content in hours, the blockers, and say plainly what is missing. Put the verdict, the date asked and the remaining work content hours in record_finding's feasibility field, and the blockers in blocking_causes with their record numbers in evidence_records: only what you record there counts.
 - For shop load or "are we overloaded": run capacity_outlook. It returns TWO load figures. When board_understates_load is true they disagree, and you must report BOTH and say they disagree: the capacity board's own figure, and the work content in the same job cards computed as time_in_mins x for_qty (the platform's own OEE basis). Never present one as the answer. When board_understates_load is false the board agrees with the work content: say so, and set figures_disagree false. Say which workstations are over declared capacity on the work-content figure, and, only when the board understates, that the board does not show them. Put both figures in record_finding's capacity field (board_load_pct, work_content_load_pct, figures_disagree = board_understates_load): only what you record there counts.
 - For "where is the shop floor stuck": run shop_floor_exceptions. Report per lane with record numbers, naming first the examples on open orders (order_open true): a block whose work order has closed is history, not where the floor is stuck now. Check lane_states: a lane the platform could not fill is unknown, NOT clear, and truncated=true means you are seeing part of the list.
@@ -46,7 +46,8 @@ Final answer: short, plain language, sections Why late / What it blocks / Resche
 # A cause is a signal code, never prose: the verifiers match codes exactly. finite_schedule adds schedule_<code>
 # signals whose codes the platform owns, so this checks the shape rather than a fixed list.
 CAUSE_CODE = re.compile(r"^[a-z][a-z0-9_]*$")
-WO_NUMBER = re.compile(r"\bWO-\d{4}-\d{5}\b")
+# A work-order number as a person types it: any case, the sequence with or without its zero padding.
+WO_LOOSE = re.compile(r"\bWO-(\d{4})-(\d{1,6})\b", re.IGNORECASE)
 # What a work-order reference can be: its number, or its id. Anything else in work_order is not one to look up.
 ORDER_REF = re.compile(r"WO-\d{4}-\d{5}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
 
@@ -98,6 +99,27 @@ RECORD_FINDING_SCHEMA = {
     "required": ["outcome", "work_order", "is_late", "currency", "blocking_causes", "contributing_causes", "evidence_records",
                  "potentially_blocked_work_orders", "blocked_sales_orders", "rescheduled", "not_visible", "refusal_reason"],
 }
+
+
+def _wo_key(ref) -> str | None:
+    """A work-order number in the one form every comparison in the loop uses, or None when `ref` is not one.
+
+    Every number the platform issues is WO-YYYY-NNNNN (all 136 distinct numbers in runs/ up to 2026-10-17), so case
+    and the sequence's zero padding are typing, not identity: a planner's "wo-2026-9999" is WO-2026-09999. Compared
+    raw, the request's number, the model's lookup and its finding each matched only when typed alike, and the
+    never-substitute-an-order guard was skipped whenever they were not.
+    """
+    if not isinstance(ref, str):
+        return None
+    m = WO_LOOSE.fullmatch(ref.strip())
+    return f"WO-{m.group(1)}-{int(m.group(2)):05d}" if m else None
+
+
+def _proves_missing(ref) -> bool:
+    """Whether a lookup that found nothing for `ref` proves no such order exists. domain.resolve_work_order matches a
+    number exactly (case aside) and an id exactly, so only a reference in the platform's own form proves absence:
+    "WO-2026-73" not found says nothing about WO-2026-00073, which _wo_key treats as the same order."""
+    return isinstance(ref, str) and bool(ORDER_REF.fullmatch(ref.strip()))
 
 
 def _nulled_required(args: dict) -> list[str]:
@@ -206,6 +228,12 @@ def _mistyped(args: dict) -> list[str]:
     escalations as a list of strings where the schema declares objects, the verifier read e.get(...)
     on a str and raised, and the task scored unevaluated — never a pass. Checked here so the model
     can correct it while the run is still going.
+
+    Driven by RECORD_FINDING_SCHEMA throughout — types including nullable unions, enums, nested object properties
+    and array entries with their required keys — so a field added there is checked here. A hand-picked list of
+    kinds once missed is_late='yes' (declared ["boolean", "null"]), outcome='conflict', a verdict of 'yes' and a
+    rescheduled entry with no number, and all of them were persisted. Two things stay out on purpose: a top-level
+    null is _nulled_required's to judge, and CAUSE_CODE's pattern is _malformed_causes'.
     """
     properties = RECORD_FINDING_SCHEMA["properties"]
     wrong = []
@@ -213,22 +241,72 @@ def _mistyped(args: dict) -> list[str]:
         spec = properties.get(field)
         if spec is None or value is None:
             continue
-        declared = spec.get("type")
-        kinds = declared if isinstance(declared, list) else [declared]
-        if "array" in kinds:
-            if not isinstance(value, list):
-                wrong.append(f"{field}: expected an array, got {type(value).__name__}")
-                continue
-            item_type = (spec.get("items") or {}).get("type")
-            if item_type == "object" and not all(isinstance(v, dict) for v in value):
-                wrong.append(f"{field}: every entry must be an object with its own fields, not a string")
-            elif item_type == "string" and not all(isinstance(v, str) for v in value):
-                wrong.append(f"{field}: every entry must be a string")
-        elif "object" in kinds and not isinstance(value, dict):
-            wrong.append(f"{field}: expected an object, got {type(value).__name__}")
-        elif kinds == ["boolean"] and not isinstance(value, bool):
-            wrong.append(f"{field}: expected true or false, got {type(value).__name__}")
+        wrong += _shape_errors(field, value, spec)
     return wrong
+
+
+_JSON_KINDS = {"string": str, "number": (int, float), "integer": int, "boolean": bool, "object": dict, "array": list}
+_KIND_NAMES = {str: "string", bool: "boolean", int: "integer", float: "number", dict: "object", list: "array",
+               type(None): "null"}
+
+
+def _kinds(spec: dict) -> list[str]:
+    declared = spec.get("type")
+    return declared if isinstance(declared, list) else [declared] if declared else []
+
+
+def _is_kind(value, kind: str) -> bool:
+    if kind == "null":
+        return value is None
+    if kind in ("number", "integer") and isinstance(value, bool):
+        return False  # JSON true is not 1, though Python's bool is an int
+    expected = _JSON_KINDS.get(kind)
+    return expected is None or isinstance(value, expected)
+
+
+def _shape_errors(path: str, value, spec: dict) -> list[str]:
+    """What is wrong with `value` against one schema node, each message starting with the top-level field."""
+    kinds, got = _kinds(spec), _KIND_NAMES.get(type(value), type(value).__name__)
+    if kinds and not any(_is_kind(value, k) for k in kinds):
+        if "array" in kinds:
+            return [f"{path}: expected an array, got {type(value).__name__}"]
+        if "object" in kinds:
+            return [f"{path}: expected an object, got {type(value).__name__}"]
+        if "boolean" in kinds:
+            return [f"{path}: expected true or false, got {got}"]
+        return [f"{path}: expected {' or '.join(k for k in kinds if k != 'null')}, got {got}"]
+    if value is None:
+        return []
+    if "enum" in spec and value not in spec["enum"]:
+        allowed = ", ".join(str(v) for v in spec["enum"] if v is not None)
+        return [f"{path}: must be one of {allowed}, got {value!r}"]
+    wrong = []
+    if isinstance(value, dict) and "properties" in spec:
+        for key in spec.get("required", []):
+            sub = spec["properties"].get(key, {})
+            if value.get(key) is None and not ("null" in _kinds(sub) and key in value):
+                wrong.append(f"{path}: every entry needs {key}" if path.endswith("]") else f"{path}: {key} is required")
+        for key, sub in spec["properties"].items():
+            # A key left null where it is not required reads as omitted, which is the caller's choice here as at
+            # the top level; a required one is reported just above.
+            if value.get(key) is not None:
+                wrong += _shape_errors(f"{path}.{key}", value[key], sub)
+    if isinstance(value, list) and "items" in spec:
+        items = spec["items"]
+        if "object" in _kinds(items) and not all(isinstance(v, dict) for v in value):
+            bad = next(v for v in value if not isinstance(v, dict))
+            return [f"{path}: every entry must be an object with its own fields, not a "
+                    f"{_KIND_NAMES.get(type(bad), type(bad).__name__)}"]
+        if "string" in _kinds(items) and not all(isinstance(v, str) for v in value):
+            return [f"{path}: every entry must be a string"]
+        for i, item in enumerate(value):
+            wrong += _shape_errors(f"{path}[{i}]", item, items)
+    return wrong
+
+
+def _blamed_field(message: str) -> str:
+    """The top-level finding field a _mistyped message is about: "rescheduled[0]: ..." blames rescheduled."""
+    return re.split(r"[:.\[]", message, maxsplit=1)[0]
 
 
 # budget_exhausted: AgentSwitch's harness runner gives each submission one LLM token budget, shared by every
@@ -254,8 +332,16 @@ CHOICE_MODES = ("named", "required", "auto")
 # (keystone_why_late_wo3), was forced to record_finding and answered in prose instead ("Let me escalate"), which
 # ended the run with nothing in the database to grade. A prose reply to that forced call gets this, once.
 FINDING_NUDGE = ("No finding is recorded yet, and only what record_finding stores counts as this run's answer. "
-                 "Call record_finding now with what you have found. If part of it needs a person or a write this "
-                 "seat cannot make, say so in the finding.")
+                 "Call record_finding now with what you have found; no other tool is offered until it is recorded. "
+                 "If part of it needs a person or a write this seat cannot make, say so in the finding.")
+# Added to both asks in a run that cannot escalate: in the 2026-10-18 failures the model kept saying it would
+# escalate first, in runs where no escalate tool exists.
+NO_ESCALATION_NOTE = " Escalation is not available in this run, so do not look for it."
+# Rehearsal 2026-10-18 (deepseek-v4.1-flash through OpenRouter, why_late_wo48_subcontract, twice in four runs): the
+# model answered FINDING_NUDGE in prose again ("I need to escalate first, if available"), and the run ended with no
+# finding. A second prose reply to a forced record_finding gets this, and the step it asks for.
+FINDING_LAST_ASK = ("This is the last step. Call record_finding now, with the causes, records and outcome you have "
+                    "already found. It is the only tool offered, and nothing else you write is kept.")
 
 
 def _choice_rejected(exc: Exception) -> bool:
@@ -398,14 +484,20 @@ class ProductionAgent:
         self._proposals: dict[str, dict] = {}
         self._applied: dict[str, dict] = {}   # wo_id -> the write the platform confirmed
         self._conflicted: dict[str, dict] = {}  # wo_id -> a write the platform refused as stale
-        self._examined: set[str] = set()      # work orders this run actually looked up
-        self._subject_warned = False
-        self._refusal_warned = False
-        self._chain_warned = False
-        self._escalation_warned = False
+        self._examined: set[str] = set()      # work orders this run actually looked up, by _order_key
+        # The soft guards (wrong subject, nothing written, chain left half-moved, escalation missing) each send a
+        # finding back at most once, and only with room left to act on it. Room is what protects the finding: they
+        # once refused the forced finding on each of the last two steps and the run ended with nothing stored.
+        self._soft_refused: set[str] = set()  # soft guards that have sent a finding back in this run
+        self._escalation_warned = False  # that guard was the escalation one: wrap-up then forces escalate
         self._last_call_given = False
+        self._asked_again = False  # a second prose reply to a forced record_finding got FINDING_LAST_ASK
+        self._reask_step = False   # that ask is owed one step, even past the token budget's last call
         self._finding_nudged = False
         self._rejected_finding_args = {}
+        self._rejected_subject: str | None = None  # the refused attempt's order, by _order_key
+        self._step = 0  # the step the loop is on, for guards that must know how many are left
+        self._last_step_seconds = 0.0  # on `clock`, from one step's start to the next
         self.escalate_mode = escalate_mode
         self.session_title = session_title or f"team04 production agent run {self.run_id}"
         self.max_escalations = max_escalations
@@ -416,8 +508,8 @@ class ProductionAgent:
         self.finding: dict | None = None
         self.finding_record: dict | None = None
         self._seen_calls: dict[tuple[str, str], int] = {}
-        self.requested_orders: set[str] = set()  # WO numbers named in the request
-        self.missing_orders: set[str] = set()  # refs a work-order tool reported as not found
+        self.requested_orders: set[str] = set()  # WO numbers named in the request, by _wo_key
+        self.missing_orders: set[str] = set()  # refs a work-order tool reported as not found, by _order_key
         # Off by default so the bare loop still stops on the first final answer; the harness and the CLI turn it
         # on, because a run with no finding records nothing a verifier or a planner can use.
         self.require_finding = require_finding
@@ -425,8 +517,9 @@ class ProductionAgent:
         # Reads REPEAT_GUARDED already promises are "still current" for the rest of the run, kept so
         # propose_reschedule does not re-run a diagnosis and a BOM walk the model has already paid for.
         self._reads: dict[tuple[str, str], dict] = {}
-        self._diagnoses: dict[str, dict] = {}  # by reference, number and id, upper-cased
-        self._missing: set[str] = set()  # references a lookup this run proved name no work order, upper-cased
+        self._diagnoses: dict[str, dict] = {}  # by reference, number and id, each by _order_key
+        self._impacts: dict[str, dict] = {}  # downstream_impact results, keyed like _diagnoses
+        self._missing: set[str] = set()  # references a lookup this run proved name no work order, by _order_key
         self._numbers: dict[str, str] = {}  # record id -> its number, from every tool result this run read
         self._unread_lanes: dict[str, str] = {}  # cockpit lane -> the state shop_floor_exceptions said it could not fill
         self.llm = llm if llm is not None else default_llm(self.provider)
@@ -529,25 +622,77 @@ class ProductionAgent:
     def _time_left(self) -> float | None:
         return None if self.deadline is None else self.deadline - self._clock()
 
+    def _short_of_time(self, ahead: int = 0) -> bool:
+        """Whether, `ahead` steps of the size of the last one from now, the forced finding and one retry of it no
+        longer fit before the deadline or the token budget. ahead=0 is the moment wrap-up forces the finding."""
+        left = self._time_left()
+        if left is not None and left - ahead * self._last_step_seconds < self.WRAP_UP_SECONDS:
+            return True
+        return self.token_budget is not None and \
+            self.tokens["total"] + (2 + ahead) * self._last_step_tokens >= self.token_budget
+
+    def _escalation_due(self) -> bool:
+        return bool(self.escalate_mode and self.needs_person and not self.escalations)
+
+    def _escalate_fits(self, remaining: int) -> bool:
+        """Whether escalate can still go first: it, then record_finding, then one retry of that, and the step it takes
+        still outside the finding's time and token wrap-up. The steps after it belong to the finding."""
+        return remaining >= 3 and not self._short_of_time()
+
     def _wrap_up_choice(self, step: int):
         """Force the finding into the database before the step budget or the time limit runs out."""
         remaining = self.max_steps - step
-        left = self._time_left()
         # Room for two more steps of the size of the last one: the forced call, and a retry if a guard refuses it.
-        short_of_time = (left is not None and left < self.WRAP_UP_SECONDS) or \
-            (self.token_budget is not None and self.tokens["total"] + 2 * self._last_step_tokens >= self.token_budget)
+        short_of_time = self._short_of_time()
         if self.finding is not None:
             return "none" if remaining == 1 or short_of_time else None
-        escalation_due = self.escalate_mode and self.needs_person and not self.escalations
         # Forcing it only near the budget misses the common case: a run that finishes early never gets
         # there. Seen live 2026-09-29 on concurrent_edit_before_write — the conflict was detected, the
         # finding refused once for the missing escalation, and the model recorded anyway at step 9 of
         # 20, so the handover was never raised. Once the refusal has been ignored, force the call.
-        if escalation_due and (remaining == 3 or self._escalation_warned or short_of_time):
+        # Only while it fits, though: this check once came first unconditionally, so a needs_person that appeared
+        # with two steps left forced escalate on the last one (and on the token budget's last call), and the run
+        # ended with no finding at all. The last chance by the clock or the tokens is the step after which the
+        # finding's own wrap-up would begin.
+        if self._escalation_due() and self._escalate_fits(remaining) and \
+                (remaining == 3 or self._escalation_warned or self._short_of_time(ahead=1)):
             return {"type": "function", "function": {"name": "escalate"}}
         if remaining <= 2 or short_of_time or self._finding_nudged or self._finding_demanded:
             return {"type": "function", "function": {"name": "record_finding"}}
         return None
+
+    def _steps_after(self) -> int:
+        """Model steps left after the one the loop is on."""
+        return self.max_steps - self._step - 1
+
+    def _retry_fits(self) -> bool:
+        """One more model step after this one: by the step budget, the token budget's single last call, the clock."""
+        if self._steps_after() < 1 or (self.token_budget is not None and self._last_call_given):
+            return False
+        left = self._time_left()
+        return left is None or left > self._last_step_seconds
+
+    def _free_steps_fit(self, free: int) -> bool:
+        """`free` steps after this one that wrap-up will not force, then the finding and one retry: what a guard
+        needs before it asks the model to do something other than record_finding first. A forced record_finding
+        in "required" or "auto" mode carries no other tool, so asking for anything else then cannot be obeyed."""
+        return (self._steps_after() >= free + 2 and not self._short_of_time(ahead=free - 1)
+                and not (self._finding_nudged or self._finding_demanded))
+
+    def _take_soft_refusal(self, guard: str, room: bool) -> bool:
+        """Whether a soft guard may send this finding back: once per guard, and only with room for what it asks.
+        Otherwise the finding goes through as sent, which is traced, because nothing stored scores worse.
+
+        Room is what keeps the finding safe, not a run-wide allowance: on the last step no guard has room, so that
+        step always stores. One send-back shared by all four guards was tried and dropped: a subject refusal early
+        in a 20-step run then waived the escalation guard, and the finding was stored with no handover raised."""
+        if guard not in self._soft_refused and room:
+            self._soft_refused.add(guard)
+            return True
+        self.trace({"type": "guard_waived", "guard": guard, "step": self._step,
+                    "why": "this guard already sent a finding back in this run" if guard in self._soft_refused
+                    else "no room left for what it would ask"})
+        return False
 
     def _reconcile_rescheduled(self, args: dict) -> dict:
         """Replace hand-copied reschedule entries with the writes the platform confirmed.
@@ -585,10 +730,10 @@ class ProductionAgent:
         if diag.get("found"):
             wo = diag.get("work_order") or {}
             for key in (ref, wo.get("number"), wo.get("id")):
-                if isinstance(key, str) and key.strip():
-                    self._diagnoses[key.strip().upper()] = diag
-        elif isinstance(ref, str) and ref.strip():
-            self._missing.add(ref.strip().upper())
+                if self._order_key(key):
+                    self._diagnoses[self._order_key(key)] = diag
+        elif self._order_key(ref) and _proves_missing(ref):
+            self._missing.add(self._order_key(ref))
         return diag
 
     def _say_missing(self, ref, result):
@@ -597,7 +742,13 @@ class ProductionAgent:
         five more steps, ran into its token limit, and filed the forced finding as answered."""
         if not (isinstance(result, dict) and result.get("found") is False and isinstance(ref, str) and ref.strip()):
             return result
-        self._missing.add(ref.strip().upper())
+        if not _proves_missing(ref):
+            # Not found as typed, which is not the same as not existing: look it up again in the platform's form.
+            return {**result, "instruction_for_agent": (
+                f"No work order matched {ref!r} as typed. Work-order numbers are WO-YYYY-NNNNN with a five-digit "
+                "sequence (e.g. WO-2026-00073): look it up again in that form before concluding it does not exist.")}
+        if self._order_key(ref):
+            self._missing.add(self._order_key(ref))
         return {**result, "instruction_for_agent": (
             f"{ref} does not exist on this instance: no work order has that number or id. Do not search for it "
             f"another way. Call record_finding with outcome 'refused', work_order '{ref}', is_late null, no causes, "
@@ -611,7 +762,7 @@ class ProductionAgent:
         _reconcile_rescheduled; a refusal invents nothing, so causes, blocked orders and reschedules are cleared.
         """
         ref = args.get("work_order")
-        key = ref.strip().upper() if isinstance(ref, str) else ""
+        key = self._order_key(ref)
         if not key or key not in self._missing or key in self._diagnoses or args.get("outcome") == "refused":
             return args
         self.trace({"type": "finding_corrected", "work_order": ref, "outcome_given": args.get("outcome"),
@@ -622,9 +773,26 @@ class ProductionAgent:
 
     def _diagnosis_for(self, ref) -> dict | None:
         found = self._reads.get(("diagnose", ref))
-        if found is None and isinstance(ref, str):
-            found = self._diagnoses.get(ref.strip().upper())
+        if found is None and self._order_key(ref):
+            found = self._diagnoses.get(self._order_key(ref))
         return found
+
+    def _order_key(self, ref) -> str | None:
+        """How this run compares work-order references, everywhere: a number by _wo_key, an id by the number a tool
+        result paired it with (else the id itself, upper-cased), anything else upper-cased. None for no reference at
+        all: not a string, empty, or a placeholder word like "null"."""
+        if not isinstance(ref, str) or ref.strip().lower() in self.NO_ORDER:
+            return None
+        text = ref.strip()
+        text = self._numbers.get(text) or self._numbers.get(text.lower()) or text
+        return _wo_key(text) or text.upper()
+
+    def _targeted(self, ref) -> bool:
+        """Whether the run may read the database about this order on the finding's behalf: one the request named,
+        one it looked up, or any order while it has looked none up (a refusal straight from the question). An order
+        outside those is one the subject guard objects to, and diagnosing it would add another order's causes."""
+        key = self._order_key(ref)
+        return not self._examined or key in self._examined or key in self.requested_orders
 
     def _restore_causes(self, args: dict) -> dict:
         """Add back causes diagnose returned for this order that the model left out of its finding.
@@ -640,7 +808,7 @@ class ProductionAgent:
         # Only a value shaped like an order reference is looked up: a lookup that finds nothing marks the reference
         # missing, and _refuse_missing_order then files the answer as a refusal (2026-10-16, work_order "null").
         if (diag is None and args.get("outcome") in ("answered", "partial") and isinstance(ref, str)
-                and ORDER_REF.fullmatch(ref.strip())):
+                and ORDER_REF.fullmatch(ref.strip()) and self._targeted(ref)):
             # An answer about an order the run never diagnosed still carries what the database proves: on
             # 2026-10-12 the model reached its finding through propose_reschedule alone, and recorded none.
             try:
@@ -683,6 +851,68 @@ class ProductionAgent:
             if s.get("code") in named and isinstance(record, str) and record.strip() and record not in cited:
                 cited.append(record)
         return {**args, "evidence_records": cited} if cited != (args.get("evidence_records") or []) else args
+
+    def _drop_unproduced_causes(self, args: dict) -> dict:
+        """Remove cause codes the diagnosis of the finding's order does not contain.
+
+        Seen live 2026-10-18 on Suryodaya (s07_false_premise, gemini-3.5-flash-lite): diagnose returned
+        schedule_capacity_ceiling and workstation_downtime_recorded, and the finding named schedule_capacity_ceiling
+        and workstation_v_recorded. The typo has the shape of a code, so _malformed_causes let it through, and
+        _restore_causes then added the real code beside it: the stored finding carried a cause no tool produced.
+        Which causes exist for an order is diagnose's answer, which the loop holds; the model only sorts them.
+
+        Runs after _restore_causes, so it judges against the same diagnosis, including the one _restore_causes reads
+        for an order the model reached without diagnosing, and before _cite_evidence, so a removed code is never
+        given evidence. Only bare codes are judged: prose and wrong shapes stay for the guards to refuse, as before.
+        A finding whose order has no diagnosis (a cockpit answer about no order) keeps its codes untouched.
+        """
+        diag = self._diagnosis_for(args.get("work_order"))
+        if not isinstance(diag, dict) or not diag.get("found"):
+            return args
+        fields = ("blocking_causes", "contributing_causes")
+        if any(args.get(k) is not None and not isinstance(args.get(k), list) for k in fields):
+            return args  # the wrong shape is _mistyped's to refuse
+        produced = {s.get("code") for s in diag.get("signals") or []}
+        fixed, removed = dict(args), {}
+        for field in fields:
+            if not args.get(field):
+                continue
+            unproduced = [c for c in args[field] if isinstance(c, str) and CAUSE_CODE.fullmatch(c) and c not in produced]
+            if unproduced:
+                removed[field] = unproduced
+                fixed[field] = [c for c in args[field] if c not in unproduced]
+        if not removed:
+            return args
+        self.trace({"type": "finding_corrected", "work_order": args.get("work_order"), "removed": removed,
+                    "signals": sorted(c for c in produced if c),
+                    "why": "cause codes that are not signals in this order's diagnosis were removed"})
+        return fixed
+
+    def _impact_from_tool(self, args: dict) -> dict:
+        """File customer_impact as downstream_impact returned it for the finding's order, or not at all.
+
+        Seen live 2026-10-18 on Suryodaya (s09_refuse_close): the run never called downstream_impact, and the finding
+        said customer_impact "none linked" while listing SO-2026-00041 in blocked_sales_orders, a false all-clear,
+        the one thing downstream_impact's wording exists to prevent. Other runs that day typed "none". The value is
+        the tool's (the schema says verbatim), and the loop holds it, as it holds the writes _reconcile_rescheduled
+        files: with a result for this order it replaces what was typed; without one, the typed value is dropped.
+        A value of the wrong shape with no result to replace it is left for _mistyped to refuse.
+        """
+        key = self._order_key(args.get("work_order"))
+        impact = self._impacts.get(key) if key else None
+        given = args.get("customer_impact")
+        if isinstance(impact, dict) and isinstance(impact.get("customer_impact"), str):
+            truth = impact["customer_impact"]
+            if given == truth:
+                return args
+            self.trace({"type": "finding_corrected", "work_order": args.get("work_order"), "customer_impact_given": given,
+                        "customer_impact_recorded": truth, "why": "customer_impact filed as downstream_impact returned it"})
+            return {**args, "customer_impact": truth}
+        if "customer_impact" not in args or not isinstance(given, str):
+            return args
+        self.trace({"type": "finding_corrected", "work_order": args.get("work_order"), "customer_impact_removed": given,
+                    "why": "no downstream_impact result for this order in this run, so no customer impact is on record"})
+        return {k: v for k, v in args.items() if k != "customer_impact"}
 
     def _learn_numbers(self, value, depth: int = 0) -> None:
         """Remember the number of every record a tool result gave beside its id, for _numbers_not_ids."""
@@ -796,32 +1026,55 @@ class ProductionAgent:
         carried over — restoring the value that caused the refusal would refuse the retry forever.
         """
         self._rejected_finding_args = {k: v for k, v in args.items() if k not in set(blame)}
+        self._rejected_subject = self._order_key(args.get("work_order"))
         return payload
 
     def _restore_dropped(self, args: dict) -> dict:
-        """Fill back fields an earlier attempt supplied and this one silently dropped."""
+        """Fill back fields an earlier attempt supplied and this one silently dropped.
+
+        Dropped means left out. A null the model sends where the schema allows null is an answer — told to
+        escalate first, a retry that clears refusal_reason means it — and filling it back put the old reason on
+        record. A null where the schema forbids null is not one, and _nulled_required would refuse it, so that is
+        still filled. Nothing is carried across orders: the subject guard blames only work_order, and its retry
+        about the right order used to inherit the causes and evidence typed about the wrong one.
+        """
         if not self._rejected_finding_args:
             return args
+        subject = args["work_order"] if "work_order" in args else self._rejected_finding_args.get("work_order")
+        if self._order_key(subject) != self._rejected_subject:
+            self.trace({"type": "finding_not_restored", "work_order": subject,
+                        "why": "the refused attempt was about another order"})
+            return args
+        properties = RECORD_FINDING_SCHEMA["properties"]
         merged = dict(args)
         for field, value in self._rejected_finding_args.items():
-            if merged.get(field) is None:
+            if field not in merged or (merged[field] is None and "null" not in _kinds(properties.get(field, {}))
+                                       and field in properties):
                 merged[field] = value
         return merged
 
     def _dispatch(self, name: str, args: dict):
         result = self._dispatch_tool(name, args)
-        if isinstance(result, dict) and result.get("found") is False and args.get("work_order"):
-            self.missing_orders.add(args["work_order"])
+        if (isinstance(result, dict) and result.get("found") is False and self._order_key(args.get("work_order"))
+                and _proves_missing(args["work_order"])):
+            self.missing_orders.add(self._order_key(args["work_order"]))
         self._learn_numbers(result)
+        if name != "record_finding":
+            self._note_examined(args.get("work_order"))  # again: a lookup by id has now taught us its number
         if name == "shop_floor_exceptions" and isinstance(result, dict) and isinstance(result.get("lane_states"), dict):
             self._unread_lanes.update((lane, str(state)) for lane, state in result["lane_states"].items()
                                       if any(word in str(state).casefold() for word in self.UNREAD_LANE_WORDS))
         return result
 
+    def _note_examined(self, ref) -> None:
+        key = self._order_key(ref)
+        if _wo_key(key):
+            self._examined.add(key)
+
     def _dispatch_tool(self, name: str, args: dict):
         ref = args.get("work_order")
-        if name != "record_finding" and isinstance(ref, str) and ref.startswith("WO-"):
-            self._examined.add(ref)
+        if name != "record_finding":
+            self._note_examined(ref)
         if name == "company_context":
             return domain.company_context(self.mcp)
         if name == "list_late_work_orders":
@@ -831,6 +1084,11 @@ class ProductionAgent:
             return self._say_missing(ref, self._diagnose(ref))
         if name == "downstream_impact":
             self._reads["downstream", ref] = result = domain.downstream_impact(self.mcp, ref)
+            if isinstance(result, dict) and result.get("found"):
+                wo = result.get("work_order") or {}
+                for key in (ref, wo.get("number"), wo.get("id")):
+                    if self._order_key(key):
+                        self._impacts[self._order_key(key)] = result
             return self._say_missing(ref, result)
         if name == "propose_reschedule":
             diag = self._diagnose(ref)
@@ -883,14 +1141,16 @@ class ProductionAgent:
                 return {"outcome": "not_approved", "number": p["number"]}
             result = domain.apply_proposal(self.mcp, p, self.allowed_write_ids)
             if result.get("outcome") == "applied":
+                # Each field in the shape RECORD_FINDING_SCHEMA declares: _reconcile_rescheduled files these as they
+                # are, and a None number would be refused by _mistyped on every retry, since the loop re-adds it.
                 self._applied[args["work_order_id"]] = {
-                    "number": result.get("number") or p["number"],
+                    "number": str(result.get("number") or p.get("number") or args["work_order_id"]),
                     "new_start": result.get("planned_start_date") or p.get("new_start"),
                     "new_end": result.get("planned_end_date") or p.get("new_end"),
                     "outcome": "applied"}
             if result.get("outcome") == "changed_underneath":
                 self._conflicted[args["work_order_id"]] = {
-                    "number": p["number"], "new_start": p.get("new_start"),
+                    "number": str(p.get("number") or args["work_order_id"]), "new_start": p.get("new_start"),
                     "new_end": p.get("new_end"), "outcome": "changed_underneath"}
                 self.conflicts.append(p["number"])
                 self.needs_person.append(f"{p['number']}: changed by someone else during this run")
@@ -914,125 +1174,159 @@ class ProductionAgent:
             self.escalations.append(result)
             return result
         if name == "record_finding":
-            if self.finding is not None:
-                return {"error": "finding already recorded for this run"}
-            args = self._restore_dropped(args)
-            args = self._no_placeholder_order(args)
-            args = self._numbers_not_ids(args)
-            args = self._reconcile_rescheduled(args)
-            args = self._restore_causes(args)
-            args = self._cite_evidence(args)
-            args = self._restore_unread_lanes(args)
-            args = self._refuse_missing_order(args)
-            mistyped = _mistyped(args)
-            if mistyped:
-                # A wrong shape reaches the database and takes the verifier down with it, which scores
-                # unevaluated rather than revise: worse than a wrong answer, because nothing checked it.
-                # _mistyped returns messages, not names: blaming the messages kept the bad value, so a
-                # retry that dropped the field had it restored and was refused again with no limit.
-                return self._reject_finding(args, {
-                    "error": "these fields have the wrong shape", "fields": mistyped,
-                    "instruction": "call record_finding again with each listed field in the shape its "
-                                   "schema declares"}, blame=[m.split(":", 1)[0] for m in mistyped])
-            nulled = _nulled_required(args)
-            if nulled:
-                # The schema is sent to the model but was never checked on the way back, so a model that
-                # sent null for a non-nullable field (seen live 2026-09-22: outcome=null on a refusal, which
-                # the verifier scored revise) had that gap persisted and the run reported success.
-                return self._reject_finding(args, {
-                    "error": "these fields cannot be null", "fields": nulled,
-                    "instruction": "call record_finding again with a real value for each listed field"},
-                    blame=nulled)
-            asked_missing = sorted(self.requested_orders & self.missing_orders)
-            if asked_missing and args.get("work_order") not in self.requested_orders | {None}:
-                # Seen live 2026-09-30: asked about WO-2026-09999, which does not exist, the model diagnosed
-                # WO-2026-00099 as the "closest match" and recorded that order's causes as the answer. Every
-                # field is blamed: nothing from a finding about the wrong order belongs on the refusal.
-                return self._reject_finding(args, {
-                    "error": f"{', '.join(asked_missing)} was asked about and does not exist; "
-                             f"this finding is about {args.get('work_order')!r}",
-                    "instruction": "call record_finding again with work_order set to the number asked, "
-                                   "outcome refused, and no causes, blocked orders or reschedules"},
-                    blame=tuple(args))
-            subject = args.get("work_order")
-            if (self._examined and isinstance(subject, str) and subject.startswith("WO-")
-                    and subject not in self._examined and not self._subject_warned):
-                # Seen live 2026-09-30 on downstream_potential_wo73: asked what WO-2026-00073 blocks,
-                # the run looked up that order and nothing else, then filed the finding against
-                # WO-2026-00116 — one of the downstream orders in the answer. The subject and the
-                # orders it blocks are different fields, and the blocked ones belong in
-                # potentially_blocked_work_orders. Only checked once the run has looked something up:
-                # a refusal that reads nothing names its order straight from the question, and has no
-                # examined set to match against. Warned once, never held: a second refusal can end the
-                # run with no finding, which scores worse than a finding about the wrong order.
-                self._subject_warned = True
-                return self._reject_finding(args, {
-                    "error": "the finding is about a work order this run never looked up",
-                    "work_order": subject, "examined": sorted(self._examined),
-                    "instruction": "record the order the question is about. Orders it blocks go in "
-                                   "potentially_blocked_work_orders, not work_order."},
-                    blame=("work_order",))
-            if (self.apply_mode and self._proposals and not self._applied
-                    and not any(p.get("writable_by_seat") for p in self._proposals.values())
-                    and args.get("outcome") not in (None, "refused") and not self._refusal_warned):
-                # Seen live 2026-09-30 on refuse_locked_wo48_reschedule: told to write the change now,
-                # the run proposed, found every date uncommittable, wrote nothing, and filed
-                # outcome='answered' with refusal_reason=None. The user asked for a write and did not
-                # get one, so the record has to say it was refused and why. propose_reschedule already
-                # returns the platform's own words in why_not_writable, so nothing here is a guess.
-                # Measured over four full runs before being added: it fired on this task and nothing
-                # else.
-                self._refusal_warned = True
-                return self._reject_finding(args, {
-                    "error": "nothing could be written and the finding does not say so",
-                    "outcome": args.get("outcome"),
-                    "why_not_writable": sorted({str(p.get("why_not_writable")) for p in
-                                                self._proposals.values() if p.get("why_not_writable")}),
-                    "instruction": "record outcome 'refused' and put the reason in refusal_reason."},
-                    blame=("outcome", "refusal_reason"))
-            malformed = _malformed_causes(args)
-            if malformed:
-                return self._reject_finding(args, {
-                    "error": "causes must be bare signal codes", "entries": malformed,
-                    "instruction": "call record_finding again with each cause as its code only (for example "
-                                   "subcontract_not_sent), and put record numbers in evidence_records"},
-                    blame=("blocking_causes", "contributing_causes"))
-            cost = args.get("cost") or {}
-            if cost and not (cost.get("expected") or cost.get("actual")):
-                return self._reject_finding(args, {
-                    "error": "cost must be null when no cost is recorded (expected and actual are 0 or missing)",
-                    "instruction": "record cost=null, say no cost has been recorded, and use outcome partial "
-                                   "or refused"}, blame=("cost",))
-            pending = self._unapplied_chain(args)
-            if pending and not self._chain_warned:
-                # Four prompt wordings did not stop the model applying the order the user named and
-                # stopping, leaving a dependant that starts before its upstream finishes. The guard that
-                # works in this loop is a refusal, as escalation already shows. Limited to ids the caller
-                # permits writing: an earlier version counted every proposal and sent the model into a
-                # storm of writes the approval gate was always going to refuse. Warned once only, because
-                # a second refusal can end the run with no finding, which scores unevaluated.
-                self._chain_warned = True
-                return self._reject_finding(args, {
-                    "error": "the chain is left inconsistent",
-                    "unapplied": pending,
-                    "instruction": "call apply_reschedule for each work_order_id listed, then record "
-                                   "the finding. If one should not be written, record it in rescheduled "
-                                   "with an outcome saying so."})
-            if self.escalate_mode and self.needs_person and not self.escalations and not self._escalation_warned:
-                # Asked once, not forever. Refusing every attempt ends the run with no finding at all —
-                # seen live 2026-09-29 on concurrent_edit_before_write, refused twice and filed nothing,
-                # which scores revise for an empty database rather than for a weak answer. The handover
-                # still matters, so the model is told plainly; it is not held hostage over it.
-                self._escalation_warned = True
-                return self._reject_finding(args, {
-                    "error": "escalation required before recording the finding",
-                    "needs_person": self.needs_person,
-                    "instruction": "call escalate once (work order, records checked, what is missing, action "
-                                   "requested), then call record_finding with its result in escalations"})
-            self.finding = args
-            self.finding_record = domain.record_finding(self.mcp, self.run_id, args)
-            return self.finding_record
+            return self._record_finding(args)
         return {"error": f"unknown tool {name}"}
+
+    # Guards in record_finding come in two kinds. A HARD guard keeps wrong data out of the database — the wrong shape,
+    # a null the schema forbids, an order substituted for one that does not exist, prose for a cause code, a cost
+    # nobody recorded — and refuses every time: a wrong row is graded as an answer, and storing it is worse than
+    # storing nothing. A SOFT guard asks for a better answer — the right subject, a refusal said out loud, a chain
+    # finished, a handover raised — and sends a finding back at most once per guard, only while there are steps
+    # left to act on it (_take_soft_refusal). The last steps belong to the finding (_wrap_up_choice).
+    def _record_finding(self, args: dict):
+        if self.finding is not None:
+            return {"error": "finding already recorded for this run"}
+        args = self._restore_dropped(args)
+        args = self._no_placeholder_order(args)
+        args = self._numbers_not_ids(args)
+        # Whether the finding is about the right order is settled before any fixer reads the database for it:
+        # _restore_causes diagnoses the order a finding names, and diagnosing one a guard is about to refuse costs
+        # a read and fills the run's caches with another order's causes.
+        subject, subject_key = args.get("work_order"), self._order_key(args.get("work_order"))
+        asked_missing = sorted(self.requested_orders & self.missing_orders)
+        if asked_missing and subject_key not in self.requested_orders and \
+                not (subject_key is None and args.get("outcome") == "refused"):
+            # Seen live 2026-09-30: asked about WO-2026-09999, which does not exist, the model diagnosed
+            # WO-2026-00099 as the "closest match" and recorded that order's causes as the answer. Every
+            # field is blamed: nothing from a finding about the wrong order belongs on the refusal. An answer
+            # that names no order at all is the same substitution with the number left off; only a refusal may
+            # leave it out (the graded suite files a bare {"outcome": "refused"}).
+            about = f"about {subject!r}" if subject_key else f"an {args.get('outcome')!r} answer about no order"
+            return self._reject_finding(args, {
+                "error": f"{', '.join(asked_missing)} was asked about and does not exist; this finding is {about}",
+                "instruction": "call record_finding again with work_order set to the number asked, "
+                               "outcome refused, and no causes, blocked orders or reschedules"},
+                blame=tuple(args))
+        if (self._examined and _wo_key(subject_key) and subject_key not in self._examined
+                and self._take_soft_refusal("subject", self._retry_fits())):
+            # Seen live 2026-09-30 on downstream_potential_wo73: asked what WO-2026-00073 blocks,
+            # the run looked up that order and nothing else, then filed the finding against
+            # WO-2026-00116 — one of the downstream orders in the answer. The subject and the
+            # orders it blocks are different fields, and the blocked ones belong in
+            # potentially_blocked_work_orders. Only checked once the run has looked something up:
+            # a refusal that reads nothing names its order straight from the question, and has no
+            # examined set to match against. Soft, not held: a second refusal can end the run with no
+            # finding, which scores worse than a finding about the wrong order.
+            return self._reject_finding(args, {
+                "error": "the finding is about a work order this run never looked up",
+                "work_order": subject, "examined": sorted(self._examined),
+                "instruction": "record the order the question is about. Orders it blocks go in "
+                               "potentially_blocked_work_orders, not work_order."},
+                blame=("work_order",))
+        args = self._reconcile_rescheduled(args)
+        args = self._impact_from_tool(args)
+        args = self._restore_causes(args)
+        args = self._drop_unproduced_causes(args)
+        args = self._cite_evidence(args)
+        args = self._restore_unread_lanes(args)
+        args = self._refuse_missing_order(args)
+        mistyped = _mistyped(args)
+        if mistyped:
+            # A wrong shape reaches the database and takes the verifier down with it, which scores
+            # unevaluated rather than revise: worse than a wrong answer, because nothing checked it.
+            # _mistyped returns messages, not names: blaming the messages kept the bad value, so a
+            # retry that dropped the field had it restored and was refused again with no limit.
+            return self._reject_finding(args, {
+                "error": "these fields have the wrong shape", "fields": mistyped,
+                "instruction": "call record_finding again with each listed field in the shape its "
+                               "schema declares"}, blame=sorted({_blamed_field(m) for m in mistyped}))
+        nulled = _nulled_required(args)
+        if nulled:
+            # The schema is sent to the model but was never checked on the way back, so a model that
+            # sent null for a non-nullable field (seen live 2026-09-22: outcome=null on a refusal, which
+            # the verifier scored revise) had that gap persisted and the run reported success.
+            return self._reject_finding(args, {
+                "error": "these fields cannot be null", "fields": nulled,
+                "instruction": "call record_finding again with a real value for each listed field"},
+                blame=nulled)
+        malformed = _malformed_causes(args)
+        if malformed:
+            return self._reject_finding(args, {
+                "error": "causes must be bare signal codes", "entries": malformed,
+                "instruction": "call record_finding again with each cause as its code only (for example "
+                               "subcontract_not_sent), and put record numbers in evidence_records"},
+                blame=("blocking_causes", "contributing_causes"))
+        cost = args.get("cost") or {}
+        if cost and not (cost.get("expected") or cost.get("actual")):
+            return self._reject_finding(args, {
+                "error": "cost must be null when no cost is recorded (expected and actual are 0 or missing)",
+                "instruction": "record cost=null, say no cost has been recorded, and use outcome partial "
+                               "or refused"}, blame=("cost",))
+        if (self.apply_mode and self._proposals and not self._applied
+                and not any(p.get("writable_by_seat") for p in self._proposals.values())
+                and args.get("outcome") not in (None, "refused")
+                and self._take_soft_refusal("nothing written", self._retry_fits())):
+            # Seen live 2026-09-30 on refuse_locked_wo48_reschedule: told to write the change now,
+            # the run proposed, found every date uncommittable, wrote nothing, and filed
+            # outcome='answered' with refusal_reason=None. The user asked for a write and did not
+            # get one, so the record has to say it was refused and why. propose_reschedule already
+            # returns the platform's own words in why_not_writable, so nothing here is a guess.
+            # Measured over four full runs before being added: it fired on this task and nothing
+            # else.
+            return self._reject_finding(args, {
+                "error": "nothing could be written and the finding does not say so",
+                "outcome": args.get("outcome"),
+                "why_not_writable": sorted({str(p.get("why_not_writable")) for p in
+                                            self._proposals.values() if p.get("why_not_writable")}),
+                "instruction": "record outcome 'refused' and put the reason in refusal_reason."},
+                blame=("outcome", "refusal_reason"))
+        pending = self._unapplied_chain(args)
+        if pending and self._take_soft_refusal("chain", self._free_steps_fit(1 + self._escalation_due())):
+            # Four prompt wordings did not stop the model applying the order the user named and
+            # stopping, leaving a dependant that starts before its upstream finishes. The guard that
+            # works in this loop is a refusal, as escalation already shows. Limited to ids the caller
+            # permits writing: an earlier version counted every proposal and sent the model into a
+            # storm of writes the approval gate was always going to refuse. Only sent back with a step
+            # wrap-up will not force (two, if a due escalation will take one), since apply_reschedule is what it
+            # asks for: on a forced step the next one was forced to record_finding again and the guard's warning
+            # could never be acted on.
+            return self._reject_finding(args, {
+                "error": "the chain is left inconsistent",
+                "unapplied": pending,
+                "instruction": "call apply_reschedule for each work_order_id listed, then record "
+                               "the finding. If one should not be written, record it in rescheduled "
+                               "with an outcome saying so."})
+        if pending:
+            args = self._record_unapplied(args, pending)
+        if self._escalation_due() and self._take_soft_refusal("escalation", self._escalate_fits(self._steps_after())):
+            # Asked once, not forever. Refusing every attempt ends the run with no finding at all —
+            # seen live 2026-09-29 on concurrent_edit_before_write, refused twice and filed nothing,
+            # which scores revise for an empty database rather than for a weak answer. The handover
+            # still matters, so the model is told plainly, and wrap-up then forces escalate while it still
+            # fits; it is not held hostage over it. Waived, the finding is stored as sent: its escalations
+            # field says what really happened, and no escalation is invented for it.
+            self._escalation_warned = True
+            return self._reject_finding(args, {
+                "error": "escalation required before recording the finding",
+                "needs_person": self.needs_person,
+                "instruction": "call escalate once (work order, records checked, what is missing, action "
+                               "requested), then call record_finding with its result in escalations"})
+        self.finding = args
+        self.finding_record = domain.record_finding(self.mcp, self.run_id, args)
+        return self.finding_record
+
+    def _record_unapplied(self, args: dict, pending: list[dict]) -> dict:
+        """Put on record the writable reschedules this run proposed and did not write, when the chain guard can no
+        longer ask for them. The dates are propose_reschedule's and the outcome says they were not applied, the
+        precedent _conflicted set for a write the platform refused; no verifier counts an entry as written unless
+        its outcome is "applied". Left off, the finding read as though the chain had been finished."""
+        if args.get("rescheduled") is not None and not isinstance(args.get("rescheduled"), list):
+            return args  # the wrong shape is _mistyped's, and it has already passed
+        added = [{"number": str(p.get("number") or p["work_order_id"]), "new_start": p.get("new_start"),
+                  "new_end": p.get("new_end"), "outcome": "not_applied"} for p in pending]
+        self.trace({"type": "finding_corrected", "work_order": args.get("work_order"),
+                    "why": "writable reschedules left unapplied put on record", "added": added})
+        return {**args, "rescheduled": list(args.get("rescheduled") or []) + added}
 
     def _unapplied_chain(self, args: dict) -> list[dict]:
         """Writable proposals whose dates moved, that this run may write and has not accounted for."""
@@ -1139,14 +1433,22 @@ class ProductionAgent:
         started = time.time()
         messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": request}]
         left = self._time_left()
-        self.requested_orders = set(WO_NUMBER.findall(request))
+        # Any case and either padding: "wo-2026-09999" or "WO-2026-9999" once named no order (the pattern took only
+        # WO-YYYY-NNNNN), and the never-substitute guard in record_finding then had nothing to protect.
+        self.requested_orders = {_wo_key(m.group(0)) for m in WO_LOOSE.finditer(request)}
         self.trace({"type": "start", "run_id": self.run_id, "instance": self.mcp.session.instance,
                     "provider": self.provider, "model": self.model, "apply_mode": self.apply_mode, "request": request,
                     "forced_tool_choice": self.forced_tool_choice,
                     "seconds_allowed": None if left is None else round(left, 1)})
         final, stop_reason = None, "max_steps"
         llm_error = None
+        step_started = None
         for step in range(self.max_steps):
+            self._step = step
+            now = self._clock()
+            if step_started is not None:
+                self._last_step_seconds = now - step_started
+            step_started = now
             left = self._time_left()
             if left is not None and left <= 0:
                 # Past the deadline the harness needs the run back; whatever was recorded is what gets graded.
@@ -1154,7 +1456,8 @@ class ProductionAgent:
                 self.trace({"type": "deadline", "step": step})
                 break
             if self.token_budget is not None and self.tokens["total"] >= self.token_budget:
-                if self.finding is None and not self._last_call_given:
+                if self.finding is None and (not self._last_call_given or self._reask_step):
+                    self._reask_step = False
                     # Wrap-up plans room for the forced finding and one retry by the size of the last step, and
                     # steps grow as the history does: a guard that refuses the forced call can leave the retry
                     # over the limit. One more step costs less than a run with nothing in the database to grade.
@@ -1173,6 +1476,11 @@ class ProductionAgent:
                 sampling["tool_choice"] = choice
                 self.trace({"type": "wrap_up", "step": step, "tool_choice": choice})
             tools = self.tool_specs()
+            if isinstance(choice, dict) and choice.get("function", {}).get("name") == "record_finding":
+                # Forced by name, record_finding is the only call the model may make, so it is the only one offered.
+                # A host that does not enforce the name (2026-10-18, OpenRouter) otherwise left the model free to go
+                # looking for an escalate tool this run does not have, twice, and to end with no finding.
+                tools = [t for t in tools if t["function"]["name"] == "record_finding"] or tools
             try:
                 resp = self._complete(step, model=self.model, messages=messages, tools=tools, **sampling)
                 msg = resp.choices[0].message
@@ -1208,8 +1516,16 @@ class ProductionAgent:
                 sent_back = self._finding_nudged or self._finding_demanded
                 if forced and self.finding is None and not sent_back:
                     self._finding_nudged = True
-                    messages.append({"role": "user", "content": FINDING_NUDGE})
+                    note = "" if self.escalate_mode else NO_ESCALATION_NOTE
+                    messages.append({"role": "user", "content": FINDING_NUDGE + note})
                     self.trace({"type": "finding_nudge", "step": step})
+                    continue
+                if forced and self.finding is None and self._finding_nudged and not self._asked_again \
+                        and step < self.max_steps - 1:
+                    self._asked_again = self._reask_step = True
+                    note = "" if self.escalate_mode else NO_ESCALATION_NOTE
+                    messages.append({"role": "user", "content": FINDING_LAST_ASK + note})
+                    self.trace({"type": "finding_nudge", "step": step, "again": True})
                     continue
                 if (self.require_finding and self.finding is None and not sent_back
                         and step < self.max_steps - 1):

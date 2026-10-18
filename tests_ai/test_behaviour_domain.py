@@ -7,16 +7,18 @@ order is recorded exposure and which is only potential, how far a dependant move
 checks it in the output of diagnose, list_late_work_orders, downstream_impact or propose_reschedule. Nothing
 here re-states a production condition inside the test.
 
-The xfail(strict=True) tests at the end record behaviour that looks wrong and is NOT fixed here: each one
-asserts what a planner would need, fails today, and turns into an XPASS failure the day the code changes, so
-the fix cannot land unnoticed.
+The sections after propose_reschedule pin five decisions that were strict xfails until they were made: customer
+impact is "unknown"/"partly unknown", never "none linked", when a linked sales order cannot be read; an all-zero
+stock check is stock_unverified (blocking, feasibility "unknown"), not a shortage; a subcontract whose goods are
+back is not overdue; a dependant of a running or closed target gets a real date or a real reason; and a past-due
+draft is late on purpose, with not_released saying why.
 
 Run: python -m pytest tests_ai/test_behaviour_domain.py -q
 """
 import pytest
 from test_behaviour_fakes import Book, pin_today, schedule_entry, work_order
 
-from prod_agent import domain
+from prod_agent import agent, domain
 from prod_agent.mcp_client import McpError
 
 
@@ -64,7 +66,7 @@ def test_a_material_shortage_blocks_because_no_ready_date_is_known():
 
     [short] = _signals(diag, "material_shortage")
     assert short["blocking"] is True and short["record"] == "item-bracket" and short["shortage"] == 6
-    assert _signals(diag, "stock_check_unreliable") == []
+    assert _signals(diag, "stock_unverified") == []
 
 
 def test_a_shortage_stops_the_reschedule_date_as_an_undated_blocker():
@@ -232,50 +234,335 @@ def test_a_not_started_target_is_proposed_but_not_writable():
     assert got["WO-A"]["writable_by_seat"] is False and "not_started" in got["WO-A"]["why_not_writable"]
 
 
-# --------------------------------------------------------------- suspected defects, recorded not fixed
+def _no_empty_why(proposals):
+    """A proposal that cannot be committed always says what stops it: never "no committable date: " and nothing."""
+    for p in proposals.values() if isinstance(proposals, dict) else proposals:
+        if p["why_not_writable"] is not None:
+            assert p["why_not_writable"].split(":", 1)[-1].strip(), f"empty reason: {p}"
 
-@pytest.mark.xfail(strict=True, reason="defect: every SalesOrder.get failing still reports 'none linked', which the "
-                                       "prompt tells the model means no customer is affected")
-def test_customer_impact_is_not_none_linked_when_every_sales_order_read_fails():
+
+# --------------------------------------------------------------- customer impact when sales orders cannot be read
+
+def _with_mto_consumer(book, start="2026-09-11", end="2026-09-14"):
+    """Adds WO-C: make-to-order, no sales order, consuming WO-A's output like WO-B."""
+    book.tables["WorkOrder"].append(work_order("WO-C", "draft", start=start, end=end, bom_id="bom-b",
+                                               production_strategy="make_to_order"))
+    return book
+
+
+def test_customer_impact_is_unknown_when_every_sales_order_read_fails():
+    """Was 'none linked', which the prompt lets the model read as no customer affected. Both orders carry one."""
     out = domain.downstream_impact(_chain_book(failing={"SalesOrder.get"}), "WO-A")
     assert len(out["not_visible_to_this_seat"]) == 2
-    assert not out["customer_impact"].startswith("none linked")
+    impact = out["customer_impact"]
+    assert impact.startswith("unknown: ")
+    assert "so-1 via WO-A: permission_denied" in impact and "so-2 via WO-B: permission_denied" in impact
+    assert out["blocked_sales_orders"] == []
 
 
-@pytest.mark.xfail(strict=True, reason="defect: a shortage from a stock check flagged stock_check_unreliable is "
-                                       "still reported as a blocking cause")
-def test_a_shortage_from_an_unreliable_stock_check_does_not_block():
+def test_an_unread_sales_order_is_named_by_its_number_when_the_work_order_carries_it():
+    book = _chain_book(failing={"SalesOrder.get"})
+    book.tables["WorkOrder"][0]["_sales_order_id_display"] = "SO-1"
+    impact = domain.downstream_impact(book, "WO-A")["customer_impact"]
+    assert "SO-1 (id so-1) via WO-A: permission_denied" in impact and "so-2 via WO-B" in impact
+
+
+def test_customer_impact_is_partly_unknown_when_some_sales_orders_read_and_some_fail():
+    book = _chain_book()
+    book.tables["SalesOrder"] = book.tables["SalesOrder"][:1]  # SO-2 no longer readable: not_found
+    out = domain.downstream_impact(book, "WO-A")
+    impact = out["customer_impact"]
+    assert impact.startswith("partly unknown: ")
+    assert "read SO-1 via WO-A" in impact and "could not read so-2 via WO-B: not_found" in impact
+    assert [s["number"] for s in out["blocked_sales_orders"]] == ["SO-1"]
+
+
+def test_partly_unknown_keeps_both_causes_an_unlinked_make_to_order_and_a_failed_read():
+    book = _with_mto_consumer(_chain_book())
+    book.tables["SalesOrder"] = book.tables["SalesOrder"][:1]
+    impact = domain.downstream_impact(book, "WO-A")["customer_impact"]
+    assert impact.startswith("partly unknown: ")
+    assert "make-to-order without a linked sales order: WO-C" in impact
+    assert "read SO-1 via WO-A" in impact and "could not read so-2 via WO-B: not_found" in impact
+
+
+def test_unknown_keeps_an_unlinked_make_to_order_beside_the_failed_reads():
+    impact = domain.downstream_impact(_with_mto_consumer(_chain_book(failing={"SalesOrder.get"})), "WO-A")["customer_impact"]
+    assert impact.startswith("unknown: ")
+    assert "so-1 via WO-A: permission_denied" in impact and "make-to-order without a linked sales order: WO-C" in impact
+
+
+def test_make_to_order_alone_reads_as_before():
+    impact = domain.downstream_impact(_with_mto_consumer(_chain_book()), "WO-A")["customer_impact"]
+    assert impact == "partly unknown: make-to-order without a linked sales order: WO-C"
+
+
+def test_none_linked_only_when_no_order_in_the_chain_carries_a_sales_order():
+    book = _chain_book(failing={"SalesOrder.get"})
+    for w in book.tables["WorkOrder"]:
+        w["sales_order_id"] = None
+    out = domain.downstream_impact(book, "WO-A")
+    assert out["customer_impact"].startswith("none linked")
+    assert not any(name == "SalesOrder.get" for name, _ in book.calls)
+
+
+def test_a_seat_without_sales_orders_is_still_undeterminable_not_unknown():
+    out = domain.downstream_impact(_chain_book(tools=(), failing={"SalesOrder.get"}), "WO-A")
+    assert out["customer_impact"] == "undeterminable: sales orders are not visible to this seat"
+
+
+def test_the_prompt_reads_unknown_customer_impact_as_unknown():
+    assert 'If it starts with "undeterminable", "unknown" or "partly unknown"' in agent.SYSTEM_PROMPT
+
+
+# --------------------------------------------------------------- stock that reads 0 everywhere
+
+def _stock(wo, *items):
+    return Book(tables={"WorkOrder": [wo]}, stock={wo["id"]: list(items)})
+
+
+def _line(item, required, available):
+    return {"item_id": item, "required": required, "available": available,
+            "shortage": max(required - available, 0), "is_critical": item == "item-a"}
+
+
+def test_an_all_zero_stock_check_is_unverified_not_a_shortage():
+    """Was a blocking material_shortage per line beside a stock_check_unreliable that said not to trust them."""
     wo = work_order("WO-2026-00063", "not_started", start="2026-09-20", end="2026-09-30")
-    book = Book(tables={"WorkOrder": [wo]}, stock={wo["id"]: [
-        {"item_id": "item-a", "required": 4, "available": 0, "shortage": 4, "is_critical": True},
-        {"item_id": "item-b", "required": 2, "available": 0, "shortage": 2, "is_critical": False}]})
-    diag = domain.diagnose(book, "WO-2026-00063")
-    assert _signals(diag, "stock_check_unreliable")
-    assert not any(s["blocking"] for s in _signals(diag, "material_shortage"))
+    diag = domain.diagnose(_stock(wo, _line("item-a", 4, 0), _line("item-b", 2, 0)), "WO-2026-00063")
+    assert _signals(diag, "material_shortage") == [] and _signals(diag, "stock_check_unreliable") == []
+    [unverified] = _signals(diag, "stock_unverified")
+    assert unverified["blocking"] is True, "no date can be committed until stock is confirmed"
+    assert [(i["item_id"], i["required"], i["shortage"]) for i in unverified["items"]] == [("item-a", 4, 4), ("item-b", 2, 2)]
+    assert "could not be confirmed" in unverified["note"] and "empty store" in unverified["note"]
 
 
-@pytest.mark.xfail(strict=True, reason="defect: a subcontract already received or in quality check is flagged "
-                                       "subcontract_overdue once its expected date has passed")
+def test_stock_unverified_is_a_bare_cause_code_and_an_undated_blocker():
+    assert agent.CAUSE_CODE.fullmatch(domain.STOCK_UNVERIFIED) and domain.STOCK_UNVERIFIED in domain.UNDATED_BLOCKERS
+
+
+def test_one_component_in_stock_makes_the_check_believable_so_shortages_block():
+    wo = work_order("WO-2026-00063", "not_started", start="2026-09-20", end="2026-09-30")
+    diag = domain.diagnose(_stock(wo, _line("item-a", 4, 0), _line("item-b", 2, 1)), "WO-2026-00063")
+    assert _signals(diag, "stock_unverified") == []
+    assert [(s["record"], s["blocking"]) for s in _signals(diag, "material_shortage")] == [("item-a", True), ("item-b", True)]
+
+
+def test_all_zero_with_nothing_required_raises_no_stock_signal():
+    wo = work_order("WO-2026-00063", "not_started", start="2026-09-20", end="2026-09-30")
+    diag = domain.diagnose(_stock(wo, _line("item-a", 0, 0)), "WO-2026-00063")
+    assert not [s for s in diag["signals"] if s["code"] in ("stock_unverified", "material_shortage")]
+
+
+def test_unverified_stock_stops_the_reschedule_date():
+    wo = work_order("WO-2026-00063", "draft", start="2026-09-20", end="2026-09-30")
+    [p] = domain.propose_reschedule(_stock(wo, _line("item-a", 4, 0)), "WO-2026-00063")["proposals"]
+    assert p["date_committable"] is False and p["why_not_writable"] == "no committable date: stock_unverified"
+
+
+def test_feasibility_is_unknown_when_unverified_stock_is_the_only_blocker():
+    wo = work_order("WO-2026-00063", "not_started", start="2026-09-20", end="2026-09-30")
+    out = domain.order_feasible_by(_stock(wo, _line("item-a", 4, 0)), "WO-2026-00063", "2026-10-30")
+    assert out["verdict"] == "unknown" and out["blocking_causes"] == ["stock_unverified"]
+    assert "stock could not be confirmed" in out["reason"] and "check stock" in out["reason"]
+
+
+def test_feasibility_is_no_when_another_undated_blocker_stands_beside_unverified_stock():
+    wo = work_order("WO-2026-00063", "not_started", start="2026-09-20", end="2026-09-30")
+    book = _stock(wo, _line("item-a", 4, 0))
+    book.tables["SubcontractOrder"] = [_sco("SCO-2026-00041", wo, "draft")]
+    out = domain.order_feasible_by(book, "WO-2026-00063", "2026-10-30")
+    assert out["verdict"] == "no" and out["blocking_causes"] == ["stock_unverified", "subcontract_not_sent"]
+
+
+def test_feasibility_is_no_behind_a_real_shortage():
+    wo = work_order("WO-2026-00063", "not_started", start="2026-09-20", end="2026-09-30")
+    out = domain.order_feasible_by(_stock(wo, _line("item-a", 4, 0), _line("item-b", 2, 2)), "WO-2026-00063", "2026-10-30")
+    assert out["verdict"] == "no" and out["blocking_causes"] == ["material_shortage"]
+
+
+def test_feasibility_is_no_for_a_past_date_even_when_only_stock_is_unverified():
+    wo = work_order("WO-2026-00063", "not_started", start="2026-09-20", end="2026-09-30")
+    out = domain.order_feasible_by(_stock(wo, _line("item-a", 4, 0)), "WO-2026-00063", "2026-09-01")
+    assert out["verdict"] == "no" and "already past" in out["reason"]
+
+
+# --------------------------------------------------------------- subcontract stages
+
+@pytest.mark.parametrize("status, expected, code, blocking", [
+    ("draft", "2026-09-01", "subcontract_not_sent", True),
+    ("draft", "2026-09-30", "subcontract_not_sent", True),
+    ("submitted", "2026-09-01", "subcontract_overdue", True),
+    ("materials_sent", "2026-09-01", "subcontract_overdue", True),
+    ("in_progress", "2026-09-01", "subcontract_overdue", True),
+    ("submitted", "2026-09-30", "subcontract_pending", False),
+    ("materials_sent", "2026-09-30", "subcontract_pending", False),
+    ("in_progress", "2026-09-30", "subcontract_pending", False),
+    ("received", "2026-09-01", "subcontract_received", False),
+    ("received", "2026-09-30", "subcontract_received", False),
+    ("quality_check", "2026-09-01", "subcontract_in_inspection", False),
+    ("quality_check", "2026-09-30", "subcontract_in_inspection", False),
+])
+def test_each_subcontract_stage_gives_its_signal(status, expected, code, blocking):
+    wo = work_order("WO-2026-00064", "in_progress", start="2026-08-20", end="2026-09-30")
+    book = Book(tables={"WorkOrder": [wo], "SubcontractOrder": [_sco("SCO-2026-00040", wo, status, expected)]})
+    [s] = [s for s in domain.diagnose(book, "WO-2026-00064")["signals"] if s["code"].startswith("subcontract_")]
+    assert (s["code"], s["blocking"], s["record"]) == (code, blocking, "SCO-2026-00040")
+    assert (s["status"], s["expected_delivery_date"], s["vendor"]) == (status, expected, "Anand Platers")
+    assert agent.CAUSE_CODE.fullmatch(s["code"])
+    # Only a subcontract still out with the vendor has a ready date; goods back carry none to wait for.
+    assert s.get("ready_date") == (expected if code == "subcontract_pending" else None)
+
+
 @pytest.mark.parametrize("status", ["received", "quality_check"])
 def test_a_received_subcontract_is_not_overdue(status):
+    """Was subcontract_overdue (blocking) once the expected date passed, though the goods were already back."""
     wo = work_order("WO-2026-00064", "in_progress", start="2026-08-20", end="2026-09-30")
     book = Book(tables={"WorkOrder": [wo], "SubcontractOrder": [_sco("SCO-2026-00040", wo, status)]})
-    assert _signals(domain.diagnose(book, "WO-2026-00064"), "subcontract_overdue") == []
+    diag = domain.diagnose(book, "WO-2026-00064")
+    assert _signals(diag, "subcontract_overdue") == []
+    assert not any(s["blocking"] for s in diag["signals"] if s["code"].startswith("subcontract_"))
 
 
-@pytest.mark.xfail(strict=True, reason="defect: a dependant of an in_progress target gets why_not_writable "
-                                       "'no committable date: ' with no cause after the colon")
+def test_a_subcontract_in_inspection_says_no_finish_date_is_recorded():
+    wo = work_order("WO-2026-00064", "in_progress", start="2026-08-20", end="2026-09-30")
+    book = Book(tables={"WorkOrder": [wo], "SubcontractOrder": [_sco("SCO-2026-00040", wo, "quality_check")]})
+    [s] = _signals(domain.diagnose(book, "WO-2026-00064"), "subcontract_in_inspection")
+    assert "in inspection" in s["note"] and "no inspection finish date is recorded" in s["note"]
+
+
+@pytest.mark.parametrize("status", ["completed", "cancelled"])
+def test_a_closed_subcontract_gives_no_signal(status):
+    wo = work_order("WO-2026-00064", "in_progress", start="2026-08-20", end="2026-09-30")
+    book = Book(tables={"WorkOrder": [wo], "SubcontractOrder": [_sco("SCO-2026-00040", wo, status)]})
+    assert not [s for s in domain.diagnose(book, "WO-2026-00064")["signals"] if s["code"].startswith("subcontract_")]
+
+
+@pytest.mark.parametrize("status", ["received", "quality_check"])
+def test_goods_back_from_the_subcontractor_do_not_stop_the_reschedule_date(status):
+    wo = work_order("WO-2026-00064", "draft", start="2026-09-01", end="2026-09-05")
+    book = Book(tables={"WorkOrder": [wo], "SubcontractOrder": [_sco("SCO-2026-00040", wo, status)]})
+    [p] = domain.propose_reschedule(book, "WO-2026-00064")["proposals"]
+    assert p["date_committable"] is True and p["writable_by_seat"] is True
+
+
+# --------------------------------------------------------------- reschedule around a target that is running or closed
+
+def _grandchild(book, start="2026-09-12", end="2026-09-15"):
+    """Adds WO-D, whose BOM consumes WO-B's output."""
+    book.tables["WorkOrder"].append(work_order("WO-D", "draft", start=start, end=end, bom_id="bom-d"))
+    book.tables["BOM"].append(_bom_consuming("bom-d", "item-WO-B"))
+    return book
+
+
 def test_a_dependant_of_a_running_order_says_why_it_cannot_be_written():
+    """Was why_not_writable 'no committable date: ' with nothing after the colon."""
     book = _chain_book()
     book.tables["WorkOrder"][0]["status"] = "in_progress"
-    why = _proposals(book)["WO-B"]["why_not_writable"]
-    assert why.split(":", 1)[-1].strip(), f"empty reason: {why!r}"
+    got = _proposals(book)
+    assert "WO-A" not in got, "a running target has nothing to move"
+    assert got["WO-B"]["date_committable"] is False and got["WO-B"]["writable_by_seat"] is False
+    assert got["WO-B"]["reason"] == "waits on WO-A, which is in progress; its finish date is not known"
+    assert got["WO-B"]["why_not_writable"] == "no committable date: WO-A is in progress and its finish date is not known"
+    _no_empty_why(got)
 
 
-@pytest.mark.xfail(strict=True, reason="defect: a draft past its planned end is counted late, though the platform's "
-                                       "own late query is status in (not_started, in_progress, stopped)")
-def test_a_past_due_draft_is_not_late():
+def test_a_running_order_with_a_projected_finish_dates_its_dependants_from_it():
+    book = _chain_book()
+    target = book.tables["WorkOrder"][0]
+    target["status"] = "in_progress"
+    book.schedule = [schedule_entry(target, "late", projected_finish="2026-09-25")]
+    got = _proposals(book)
+    assert "WO-A" not in got
+    assert (got["WO-B"]["new_start"], got["WO-B"]["new_end"]) == ("2026-09-26", "2026-09-29")
+    assert got["WO-B"]["writable_by_seat"] is True and got["WO-B"]["date_committable"] is True
+    assert "platform's projected finish for WO-A" in got["WO-B"]["reason"] and "2026-09-25" in got["WO-B"]["reason"]
+
+
+def test_a_projected_finish_already_past_counts_from_today():
+    book = _chain_book()
+    target = book.tables["WorkOrder"][0]
+    target["status"] = "in_progress"
+    book.schedule = [schedule_entry(target, "late", projected_finish="2026-09-10")]
+    proposal = _proposals(book)["WO-B"]
+    assert proposal["new_start"] == "2026-09-17"
+    # Review: the reason called today's date the platform's projection. It must give the platform's own date.
+    assert "projected WO-A to finish 2026-09-10, already past" in proposal["reason"]
+    assert "counts from today, 2026-09-16" in proposal["reason"]
+
+
+def test_a_future_projected_finish_is_named_as_the_platforms_date():
+    book = _chain_book()
+    target = book.tables["WorkOrder"][0]
+    target["status"] = "in_progress"
+    book.schedule = [schedule_entry(target, "late", projected_finish="2026-09-25")]
+    proposal = _proposals(book)["WO-B"]
+    assert proposal["new_start"] == "2026-09-26"
+    assert "date from the platform's projected finish for WO-A, 2026-09-25" in proposal["reason"]
+
+
+def test_a_running_order_with_an_undated_blocker_dates_nothing_even_with_a_projection():
+    """finite_schedule's projection cannot see a blocker with no date, so it cannot carry the dependants."""
+    book = _chain_book()
+    target = book.tables["WorkOrder"][0]
+    target["status"] = "in_progress"
+    book.schedule = [schedule_entry(target, "late", projected_finish="2026-09-25")]
+    book.tables["SubcontractOrder"] = [_sco("SCO-2026-00042", target, "draft")]
+    got = _proposals(book)
+    assert got["WO-B"]["date_committable"] is False
+    assert got["WO-B"]["why_not_writable"] == "no committable date: subcontract_not_sent"
+
+
+@pytest.mark.parametrize("status", ["completed", "cancelled"])
+def test_a_closed_target_constrains_no_dependant(status):
+    """Its dependants keep their dates; one waiting on a dependant still follows that dependant's own planned end."""
+    book = _grandchild(_chain_book())
+    book.tables["WorkOrder"][0]["status"] = status
+    got = _proposals(book)
+    assert "WO-A" not in got and "WO-B" not in got
+    # WO-B is planned to end 2026-09-13 and WO-D starts on the 12th, so WO-D moves to the 14th.
+    assert (got["WO-D"]["new_start"], got["WO-D"]["new_end"]) == ("2026-09-14", "2026-09-17")
+    assert got["WO-D"]["reason"] == "must start after WO-B finishes"
+
+
+def test_a_stopped_target_is_still_proposed_but_not_writable():
+    book = _chain_book()
+    book.tables["WorkOrder"][0]["status"] = "stopped"
+    got = _proposals(book)
+    assert (got["WO-A"]["new_start"], got["WO-A"]["new_end"]) == ("2026-09-16", "2026-09-20")
+    assert got["WO-A"]["date_committable"] is True and got["WO-A"]["writable_by_seat"] is False
+    assert got["WO-A"]["why_not_writable"].startswith("status 'stopped'")
+    assert got["WO-B"]["new_start"] == "2026-09-21"
+
+
+def test_waiting_on_a_running_dependant_names_it_rather_than_the_target():
+    book = _grandchild(_chain_book())
+    book.tables["WorkOrder"][1]["status"] = "in_progress"
+    got = _proposals(book)
+    assert got["WO-D"]["reason"] == "waits on WO-B, which is in progress; its finish date is not known"
+    assert got["WO-D"]["why_not_writable"] == "no committable date: WO-B is in progress and its finish date is not known"
+
+
+def test_a_blocked_target_passes_its_blockers_down_the_chain():
+    book = _grandchild(_chain_book())
+    book.tables["SubcontractOrder"] = [_sco("SCO-2026-00043", book.tables["WorkOrder"][0], "draft")]
+    got = _proposals(book)
+    assert got["WO-A"]["why_not_writable"] == "no committable date: subcontract_not_sent"
+    assert got["WO-B"]["reason"] == "waits on WO-A, whose date cannot be committed"
+    assert got["WO-B"]["why_not_writable"] == got["WO-D"]["why_not_writable"] == "no committable date: subcontract_not_sent"
+    _no_empty_why(got)
+
+
+# --------------------------------------------------------------- drafts are late on purpose
+
+def test_a_past_due_draft_is_late_on_purpose_and_says_it_is_unreleased():
+    """The platform's late query leaves drafts out; we count them, because the harness's own late orders are past-due
+    drafts (late_draft_chain, complex_planted_instruction). not_released tells the planner it was never released."""
     wo = work_order("WO-2026-00065", "draft", start="2026-08-01", end="2026-08-10")
     book = Book(tables={"WorkOrder": [wo]})
-    assert domain.diagnose(book, "WO-2026-00065")["is_late"] is False
-    assert domain.list_late_work_orders(book) == []
+    diag = domain.diagnose(book, "WO-2026-00065")
+    assert "draft" in domain.OPEN_WO
+    assert diag["is_late"] is True and diag["days_past_due"] == 37
+    [unreleased] = _signals(diag, "not_released")
+    assert unreleased["record"] == "WO-2026-00065" and unreleased["blocking"] is False
+    assert [r["number"] for r in domain.list_late_work_orders(book)] == ["WO-2026-00065"]
