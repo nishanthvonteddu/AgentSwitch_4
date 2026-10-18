@@ -994,7 +994,12 @@ def _lookup_item(mcp: McpClient, ref: str) -> tuple[dict | None, list[dict], int
     return None, near[:ITEM_CANDIDATES_MAX], len(near)
 
 
-def _item_or_miss(mcp: McpClient, item: str) -> tuple[dict | None, dict | None]:
+# An item number as the platform issues it (ITEM-2026-00019): structural, never typed prose, so it is safe to put
+# inside an instruction the model is meant to follow.
+ITEM_NUMBER_RE = re.compile(r"^[A-Z]+-\d{4}-\d{3,6}$")
+
+
+def _item_or_miss(mcp: McpClient, item: str, tool: str) -> tuple[dict | None, dict | None]:
     """The item `item` names, or else the not-found answer to return in its place.
 
     Seen live 2026-10-18 on Keystone (s10_by_item_name, gemini-3.5-flash-lite): asked about "the Cab Step Frame
@@ -1011,10 +1016,20 @@ def _item_or_miss(mcp: McpClient, item: str) -> tuple[dict | None, dict | None]:
         miss["candidates"] = near
         if total > len(near):
             miss["candidates_total"] = total
-        miss["instruction_for_agent"] = (
-            "Nothing matched exactly, so no item was chosen. The candidates' names or codes contain the text given. "
-            "If one of them is plainly the item meant, call this tool again with its exact number; if several "
-            "could be, ask the user which one. Never pick one by guessing, and do not search Item rows instead.")
+        only = near[0].get("number") if len(near) == 1 and total == 1 else None
+        if isinstance(only, str) and ITEM_NUMBER_RE.match(only):
+            # Seen live 2026-10-18 again, after candidates were added: one candidate, a conditional instruction,
+            # and the model still paged Item rows for nine more steps. A concrete next call is followed; it is
+            # still the model's call to make, and it names the item by number only, never by its typed name.
+            miss["instruction_for_agent"] = (
+                f"No item has exactly that name, but exactly one item contains it: {only}. If that is the item "
+                f"meant, your next call is {tool} with item \"{only}\". Do not search Item rows.")
+        else:
+            miss["instruction_for_agent"] = (
+                "Nothing matched exactly, so no item was chosen. The candidates' names or codes contain the text "
+                "given. If one of them is plainly the item meant, call this tool again with its exact number; if "
+                "several could be, ask the user which one. Never pick one by guessing, and do not search Item rows "
+                "instead.")
     return None, miss
 
 
@@ -1030,7 +1045,7 @@ def where_is_item_used(mcp: McpClient, item: str) -> dict:
     Consumed and produced are reported separately on purpose. "Which BOMs use this item" was answered
     with the BOM that makes it, which is the opposite relationship.
     """
-    found, miss = _item_or_miss(mcp, item)
+    found, miss = _item_or_miss(mcp, item, "where_is_item_used")
     if miss:
         return miss
     if not mcp.has_tool("BOM.list"):
@@ -1080,7 +1095,7 @@ def find_orders_for_item(mcp: McpClient, item: str) -> dict:
     page is far more likely to show a finished order than the live one. `.list` filters on item_id and
     on a status list at the server, so this is one narrow read and the closed orders never reach the model.
     """
-    found, miss = _item_or_miss(mcp, item)
+    found, miss = _item_or_miss(mcp, item, "find_orders_for_item")
     if miss:
         return miss
     today = config.today()
